@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls /c/Users/iainj/Documents/prop/*.csv)",
+      "Bash(npm install better-sqlite3)",
+      "Bash(npm install --save-dev @types/better-sqlite3)",
+      "Bash(python3 -:*)",
+      "Bash(python3 -c \":*)"
+    ]
+  }
+}

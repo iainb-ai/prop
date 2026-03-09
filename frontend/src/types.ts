@@ -1,6 +1,15 @@
 export type PropertyTypeCode = 'D' | 'S' | 'T' | 'F' | 'O';
 export type EstateTypeCode = 'F' | 'L';
 
+export interface LoadingState {
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  progress: number;
+  rowsProcessed: number;
+  message: string;
+  log: string[];
+  error?: string;
+}
+
 export interface PropertyTypeSummary {
   propertyType: string;
   label: string;
@@ -17,6 +26,34 @@ export interface PropertyTypeSummary {
 export interface OverallSummary {
   all: PropertyTypeSummary;
   byPropertyType: PropertyTypeSummary[];
+}
+
+export interface YearlyDataPoint {
+  year: number;
+  medianPrice: number;
+  meanPrice: number;
+  q1Price: number;
+  q3Price: number;
+  count: number;
+  yoyPctChange: number | null;
+  priceIndex: number | null;
+}
+
+export interface PropertyTypeTrend {
+  propertyType: string;
+  label: string;
+  color: string;
+  dataPoints: YearlyDataPoint[];
+  cagr: number | null;
+  totalTransactions: number;
+}
+
+export interface MarketTrends {
+  byPropertyType: PropertyTypeTrend[];
+  combined: PropertyTypeTrend;
+  yearRange: { min: number; max: number };
+  totalTransactions: number;
+  isTruncated: boolean;
 }
 
 export type GroupByDimension =
@@ -87,7 +124,6 @@ export interface GroupMetrics {
 }
 
 export interface SearchRequest {
-  sessionId: string;
   query: string;
   dateFrom?: string;
   dateTo?: string;
@@ -101,25 +137,14 @@ export interface SearchResponse {
   properties: PropertyRecord[];
   groups: GroupMetrics[];
   overallSummary: OverallSummary;
+  marketTrends: MarketTrends;
   summary: {
     totalTransactions: number;
     totalProperties: number;
     propertiesWithMetrics: number;
     queryType: string;
     dateRange: { min: string; max: string } | null;
+    isTruncated: boolean;
   };
   warnings: string[];
-  isPartialResult: boolean;
-  capsTriggered: boolean;
-}
-
-export interface UploadResponse {
-  sessionId: string;
-  totalRows: number;
-  skippedRows: number;
-  skippedReasons: string[];
-  dateRange: { min: string; max: string } | null;
-  uniquePostcodes: number;
-  uniqueProperties: number;
-  processingLog: string[];
 }

@@ -14,6 +14,7 @@ interface SearchParams {
 interface Props {
   onSearch: (params: SearchParams) => void;
   searching: boolean;
+  elapsed: number;
   error: string | null;
 }
 
@@ -25,7 +26,7 @@ const GROUP_BY_OPTIONS: { value: GroupByDimension; label: string }[] = [
   { value: 'buildingOrStreet', label: 'Building / street' },
 ];
 
-export default function SearchForm({ onSearch, searching, error }: Props) {
+export default function SearchForm({ onSearch, searching, elapsed, error }: Props) {
   const [query, setQuery] = useState('');
   const [dateFrom, setDateFrom] = useState('');
   const [dateTo, setDateTo] = useState('');
@@ -78,7 +79,7 @@ export default function SearchForm({ onSearch, searching, error }: Props) {
               {searching ? (
                 <span className="flex items-center gap-2">
                   <span className="animate-spin w-4 h-4 border-2 border-white border-t-transparent rounded-full" />
-                  Searching
+                  {elapsed > 0 ? `Searching… ${elapsed}s` : 'Searching…'}
                 </span>
               ) : 'Search'}
             </button>

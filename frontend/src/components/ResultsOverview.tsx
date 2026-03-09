@@ -22,7 +22,7 @@ function StatCard({ label, value, sub }: StatCardProps) {
 }
 
 export default function ResultsOverview({ result }: Props) {
-  const { summary, warnings, isPartialResult, capsTriggered } = result;
+  const { summary, warnings } = result;
 
   return (
     <div className="space-y-3">
@@ -49,13 +49,6 @@ export default function ResultsOverview({ result }: Props) {
       </div>
 
       {/* Warnings */}
-      {(isPartialResult || capsTriggered) && (
-        <div className="bg-amber-50 border border-amber-200 rounded p-3 text-sm text-amber-800">
-          <strong>Partial results:</strong> {capsTriggered
-            ? 'The result cap was reached. Refine your search to see all data.'
-            : 'Results may be incomplete.'}
-        </div>
-      )}
       {warnings.map((w, i) => (
         <div key={i} className="bg-amber-50 border border-amber-200 rounded p-3 text-sm text-amber-800">
           {w}

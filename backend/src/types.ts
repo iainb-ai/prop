@@ -1,25 +1,15 @@
-// ─── Parsed transaction (from CSV row) ────────────────────────────────────────
+// ─── DB loading state ──────────────────────────────────────────────────────────
 
-export interface CsvTransaction {
-  uniqueId: string;
-  pricePaid: number;
-  deedDate: string;          // ISO: "YYYY-MM-DD"
-  postcode: string;          // normalised: "SW11 1AD"
-  propertyType: PropertyTypeCode;
-  newBuild: boolean;
-  estateType: EstateTypeCode;
-  saon: string;
-  paon: string;
-  street: string;
-  locality: string;
-  town: string;
-  district: string;
-  county: string;
-  transactionCategory: string;
-  linkedDataUri: string;
-  propertyKey: string;       // normalised grouping key
-  displayAddress: string;
+export interface LoadingState {
+  status: 'idle' | 'loading' | 'ready' | 'error';
+  progress: number;       // 0–100
+  rowsProcessed: number;
+  message: string;
+  log: string[];
+  error?: string;
 }
+
+// ─── Parsed transaction (from DB row) ─────────────────────────────────────────
 
 export type PropertyTypeCode = 'D' | 'S' | 'T' | 'F' | 'O';
 export type EstateTypeCode = 'F' | 'L';
@@ -34,6 +24,27 @@ export interface ParsedDataset {
   skippedReasons: string[];
   dateRange: { min: string; max: string } | null;
   uniquePropertyCount: number;
+}
+
+export interface CsvTransaction {
+  uniqueId: string;
+  pricePaid: number;
+  deedDate: string;
+  postcode: string;
+  propertyType: PropertyTypeCode;
+  newBuild: boolean;
+  estateType: EstateTypeCode;
+  saon: string;
+  paon: string;
+  street: string;
+  locality: string;
+  town: string;
+  district: string;
+  county: string;
+  transactionCategory: string;
+  linkedDataUri: string;
+  propertyKey: string;
+  displayAddress: string;
 }
 
 // ─── Domain types (used in search results) ────────────────────────────────────
@@ -101,10 +112,10 @@ export interface GroupMetrics {
 // ─── Overall summary (all matched properties, broken down by property type) ───
 
 export interface PropertyTypeSummary {
-  propertyType: string;      // 'ALL' | 'D' | 'S' | 'T' | 'F' | 'O'
+  propertyType: string;
   label: string;
   totalProperties: number;
-  includedCount: number;     // properties with >= 2 sales in range
+  includedCount: number;
   meanAvgGbpPerYear: number;
   medianAvgGbpPerYear: number;
   meanAvgPctPerYear: number;
@@ -118,6 +129,36 @@ export interface OverallSummary {
   byPropertyType: PropertyTypeSummary[];
 }
 
+// ─── Market trends (year-by-year aggregate price analysis) ────────────────────
+
+export interface YearlyDataPoint {
+  year: number;
+  medianPrice: number;
+  meanPrice: number;
+  q1Price: number;
+  q3Price: number;
+  count: number;
+  yoyPctChange: number | null;
+  priceIndex: number | null;    // 100 = base year
+}
+
+export interface PropertyTypeTrend {
+  propertyType: string;   // 'D' | 'S' | 'T' | 'F' | 'O' | 'ALL'
+  label: string;
+  color: string;
+  dataPoints: YearlyDataPoint[];
+  cagr: number | null;
+  totalTransactions: number;
+}
+
+export interface MarketTrends {
+  byPropertyType: PropertyTypeTrend[];
+  combined: PropertyTypeTrend;
+  yearRange: { min: number; max: number };
+  totalTransactions: number;
+  isTruncated: boolean;
+}
+
 // ─── API request/response types ───────────────────────────────────────────────
 
 export type GroupByDimension =
@@ -128,7 +169,6 @@ export type GroupByDimension =
   | 'buildingOrStreet';
 
 export interface SearchRequest {
-  sessionId: string;
   query: string;
   dateFrom?: string;
   dateTo?: string;
@@ -142,16 +182,16 @@ export interface SearchResponse {
   properties: PropertyRecord[];
   groups: GroupMetrics[];
   overallSummary: OverallSummary;
+  marketTrends: MarketTrends;
   summary: {
     totalTransactions: number;
     totalProperties: number;
     propertiesWithMetrics: number;
     queryType: string;
     dateRange: { min: string; max: string } | null;
+    isTruncated: boolean;
   };
   warnings: string[];
-  isPartialResult: boolean;
-  capsTriggered: boolean;
 }
 
 export interface UploadResponse {

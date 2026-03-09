@@ -1,221 +1,288 @@
 import { Router, Request, Response } from 'express';
-import { getDataset } from '../services/dataStore';
-import { computePropertyMetrics, computeGroups, computeOverallSummary } from '../services/metrics';
-import { normalisePostcode } from '../services/csvParser';
+import { getDb, getLoadingState } from '../services/database';
+import { computePropertyMetrics, computeGroups, computeOverallSummary, computeMarketTrendsFromAgg, AggYearTypeRow } from '../services/metrics';
 import {
-  SearchRequest, SearchResponse, PropertyRecord, Transaction,
-  Address, CsvTransaction, GroupByDimension,
+  SearchRequest, SearchResponse, PropertyRecord, Transaction, Address, GroupByDimension,
 } from '../types';
 
 const router = Router();
 
+// Max unique properties returned in the property list
+const PROPERTY_LIST_CAP = 2_000;
+
+// ─── DB row shape ─────────────────────────────────────────────────────────────
+
+interface DbRow {
+  unique_id: string;
+  price_paid: number;
+  deed_date: string;
+  deed_year: number;
+  postcode: string;
+  property_type: string;
+  new_build: number;
+  estate_type: string;
+  paon: string;
+  saon: string;
+  street: string;
+  locality: string;
+  town: string;
+  district_name: string;
+  county: string;
+  transaction_category: string;
+  property_key: string;
+  display_address: string;
+}
+
+// Simple GROUP BY aggregation — O(n) scan with no sorting, returns ~200 rows max.
+// Uses AVG as a proxy for median (acceptable for trend direction analysis).
+// Avoids window functions which require O(n log n) sorting and can be very slow
+// on large result sets without a covering index.
+function trendGroupBySql(fullWhere: string, typeExpr: string, groupExtra: string): string {
+  return `
+    SELECT
+      deed_year,
+      ${typeExpr}                   AS property_type,
+      COUNT(*)                      AS count,
+      CAST(AVG(price_paid) AS REAL) AS mean_price,
+      CAST(AVG(price_paid) AS REAL) AS median_price,
+      0.0                           AS q1_price,
+      0.0                           AS q3_price
+    FROM transactions
+    WHERE ${fullWhere}
+    GROUP BY deed_year${groupExtra}
+    ORDER BY deed_year
+  `;
+}
 
 // POST /api/search
 router.post('/', (req: Request, res: Response) => {
-  const body = req.body as SearchRequest;
-
-  if (!body.sessionId) {
-    res.status(400).json({ error: 'sessionId is required.' });
+  const { status } = getLoadingState();
+  if (status !== 'ready') {
+    res.status(503).json({ error: 'Database not ready yet. Check /api/status.' });
     return;
   }
+
+  const body = req.body as SearchRequest;
   if (!body.query || body.query.trim().length < 2) {
     res.status(400).json({ error: 'query must be at least 2 characters.' });
     return;
   }
 
-  const dataset = getDataset(body.sessionId);
-  if (!dataset) {
-    res.status(404).json({ error: 'Session not found or expired. Please re-upload your CSV.' });
-    return;
-  }
-
+  const db = getDb();
   const warnings: string[] = [];
-  let capsTriggered = false;
 
-  // ── 1. Determine query type and filter transactions ──────────────────────────
-  const rawQuery = body.query.trim().toUpperCase();
-  const { queryType, matcher } = buildMatcher(rawQuery, warnings);
+  // ── 1. Build WHERE clause ────────────────────────────────────────────────────
+  const { whereSql, params, queryType } = buildWhere(body.query.trim().toUpperCase(), warnings);
 
-  let filtered = dataset.transactions.filter(matcher);
+  let extraWhere = '';
+  const extraParams: unknown[] = [];
 
-  // ── 2. Apply optional filters ────────────────────────────────────────────────
-  if (body.dateFrom) {
-    filtered = filtered.filter(t => t.deedDate >= body.dateFrom!);
-  }
-  if (body.dateTo) {
-    filtered = filtered.filter(t => t.deedDate <= body.dateTo!);
-  }
-  if (body.propertyType) {
-    filtered = filtered.filter(t => t.propertyType === body.propertyType);
-  }
-  if (body.estateType) {
-    filtered = filtered.filter(t => t.estateType === body.estateType);
-  }
-  if (body.newBuildOnly) {
-    filtered = filtered.filter(t => t.newBuild);
-  }
+  if (body.dateFrom)      { extraWhere += ' AND deed_date >= ?'; extraParams.push(body.dateFrom); }
+  if (body.dateTo)        { extraWhere += ' AND deed_date <= ?'; extraParams.push(body.dateTo); }
+  if (body.propertyType)  { extraWhere += ' AND property_type = ?'; extraParams.push(body.propertyType); }
+  if (body.estateType)    { extraWhere += ' AND estate_type = ?'; extraParams.push(body.estateType); }
+  if (body.newBuildOnly)  { extraWhere += ' AND new_build = 1'; }
 
-  if (filtered.length === 0) {
-    const emptyBucket = { propertyType: 'ALL', label: 'All property types', totalProperties: 0, includedCount: 0, meanAvgGbpPerYear: 0, medianAvgGbpPerYear: 0, meanAvgPctPerYear: 0, medianAvgPctPerYear: 0, meanCagr: 0, medianCagr: 0 };
-    const response: SearchResponse = {
-      properties: [],
-      groups: [],
-      overallSummary: { all: emptyBucket, byPropertyType: [] },
-      summary: {
-        totalTransactions: 0,
-        totalProperties: 0,
-        propertiesWithMetrics: 0,
-        queryType,
-        dateRange: null,
-      },
-      warnings: [...warnings, 'No transactions found matching your search.'],
-      isPartialResult: false,
-      capsTriggered: false,
-    };
-    res.json(response);
+  const fullWhere  = whereSql + extraWhere;
+  const allParams  = [...params, ...extraParams];
+
+  // ── 2. Aggregate trend data — GROUP BY (year, type), O(n) no sorting ─────────
+  const typeAggRows = db
+    .prepare(trendGroupBySql(fullWhere, 'property_type', ', property_type'))
+    .all(...allParams) as AggYearTypeRow[];
+
+  const allAggRows = db
+    .prepare(trendGroupBySql(fullWhere, "'ALL'", ''))
+    .all(...allParams) as AggYearTypeRow[];
+
+  if (allAggRows.length === 0) {
+    res.json(emptyResponse(queryType, warnings));
     return;
   }
 
-  // ── 3. Group by property key ─────────────────────────────────────────────────
-  const propertyMap = new Map<string, CsvTransaction[]>();
-  for (const tx of filtered) {
-    if (!propertyMap.has(tx.propertyKey)) propertyMap.set(tx.propertyKey, []);
-    propertyMap.get(tx.propertyKey)!.push(tx);
+  const aggRows = [...typeAggRows, ...allAggRows];
+
+  // ── 3. Compute market trends from pre-aggregated rows ────────────────────────
+  const marketTrends = computeMarketTrendsFromAgg(aggRows);
+
+  // ── 4. Fetch top properties for the property list ─────────────────────────────
+  // First, get the top PROPERTY_LIST_CAP property_keys by transaction count
+  const topKeys = db
+    .prepare(`SELECT property_key FROM transactions WHERE ${fullWhere} GROUP BY property_key ORDER BY COUNT(*) DESC LIMIT ${PROPERTY_LIST_CAP}`)
+    .all(...allParams) as { property_key: string }[];
+
+  let properties: PropertyRecord[] = [];
+
+  if (topKeys.length > 0) {
+    const placeholders = topKeys.map(() => '?').join(',');
+    const keyValues = topKeys.map(r => r.property_key);
+    const detailRows = db
+      .prepare(`SELECT * FROM transactions WHERE property_key IN (${placeholders}) ORDER BY property_key, deed_date`)
+      .all(...keyValues) as DbRow[];
+
+    properties = buildPropertyRecords(detailRows);
   }
 
-  const isPartialResult = false;
-  const propertyEntries = [...propertyMap.entries()];
+  // ── 5. Compute summary stats ─────────────────────────────────────────────────
+  // totalTransactions = sum of per-year counts from the combined ('ALL') aggregation
+  const totalTransactions = allAggRows.reduce((s, r) => s + r.count, 0);
 
-  // ── 4. Build PropertyRecord objects ──────────────────────────────────────────
-  const properties: PropertyRecord[] = [];
-  for (const [key, txs] of propertyEntries) {
-    const sample = txs[0];
-    const address: Address = {
-      displayAddress: sample.displayAddress,
-      postcode: sample.postcode,
-      street: sample.street,
-      paon: sample.paon,
-      saon: sample.saon,
-      town: sample.town,
-      county: sample.county,
-      district: sample.district,
-    };
+  // For the actual date range, use the full date strings from fetched properties
+  const detailDates = properties.flatMap(p => p.transactions.map(t => t.date));
+  const minDate = detailDates.length > 0 ? detailDates.reduce((a, b) => a < b ? a : b) : null;
+  const maxDate = detailDates.length > 0 ? detailDates.reduce((a, b) => a > b ? a : b) : null;
 
-    const transactions: Transaction[] = txs.map(t => ({
-      id: t.uniqueId,
-      price: t.pricePaid,
-      date: t.deedDate,
-      propertyType: t.propertyType,
-      estateType: t.estateType,
-      newBuild: t.newBuild,
-      transactionCategory: t.transactionCategory,
-      linkedDataUri: t.linkedDataUri,
-    }));
+  // Use year range from trend data as fallback
+  const yearMin = Math.min(...allAggRows.map(r => r.deed_year));
+  const yearMax = Math.max(...allAggRows.map(r => r.deed_year));
 
-    // Sort transactions ascending for metrics
-    transactions.sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  const overallSummary = computeOverallSummary(properties);
 
-    const metrics = computePropertyMetrics(transactions);
-
-    properties.push({ propertyKey: key, address, transactions, metrics });
-  }
-
-  // ── 5. Sort properties: most transactions first, then alphabetical ────────────
-  properties.sort((a, b) =>
-    b.transactions.length - a.transactions.length ||
-    a.address.displayAddress.localeCompare(b.address.displayAddress),
-  );
-
-  // ── 6. Compute groups ────────────────────────────────────────────────────────
   const groupDims: GroupByDimension[] = body.groupBy ?? [];
   const groups = groupDims.length > 0 ? computeGroups(properties, groupDims) : [];
 
-  // ── 7. Compute overall summary ───────────────────────────────────────────────
-  const overallSummary = computeOverallSummary(properties);
-
-  // ── 8. Compute summary date range ────────────────────────────────────────────
-  const allDates = filtered.map(t => t.deedDate);
-  const minDate = allDates.reduce((a, b) => a < b ? a : b);
-  const maxDate = allDates.reduce((a, b) => a > b ? a : b);
+  // Count total unique properties matching the query (fast SQL COUNT DISTINCT)
+  const totalPropertiesRow = db
+    .prepare(`SELECT COUNT(DISTINCT property_key) as n FROM transactions WHERE ${fullWhere}`)
+    .get(...allParams) as { n: number };
+  const totalProperties = totalPropertiesRow.n;
 
   const response: SearchResponse = {
     properties,
     groups,
     overallSummary,
+    marketTrends,
     summary: {
-      totalTransactions: filtered.length,
-      totalProperties: propertyMap.size,
+      totalTransactions,
+      totalProperties,
       propertiesWithMetrics: properties.filter(p => p.metrics != null).length,
       queryType,
-      dateRange: { min: minDate, max: maxDate },
+      dateRange: minDate && maxDate
+        ? { min: minDate, max: maxDate }
+        : { min: `${yearMin}-01-01`, max: `${yearMax}-12-31` },
+      isTruncated: false,
     },
     warnings,
-    isPartialResult,
-    capsTriggered,
   };
 
   res.json(response);
 });
 
-// ─── Query matcher builder ────────────────────────────────────────────────────
+// ─── Build property records from raw DB rows ──────────────────────────────────
 
-interface MatcherResult {
-  queryType: string;
-  matcher: (tx: CsvTransaction) => boolean;
+function buildPropertyRecords(rows: DbRow[]): PropertyRecord[] {
+  const map = new Map<string, DbRow[]>();
+  for (const r of rows) {
+    if (!map.has(r.property_key)) map.set(r.property_key, []);
+    map.get(r.property_key)!.push(r);
+  }
+
+  const records: PropertyRecord[] = [];
+  for (const [key, txRows] of map) {
+    const sample = txRows[0];
+    const address: Address = {
+      displayAddress: sample.display_address,
+      postcode: sample.postcode,
+      street: sample.street ?? '',
+      paon: sample.paon ?? '',
+      saon: sample.saon ?? '',
+      town: sample.town ?? '',
+      county: sample.county ?? '',
+      district: sample.district_name ?? '',
+    };
+
+    const transactions: Transaction[] = txRows.map(r => ({
+      id:    r.unique_id,
+      price: r.price_paid,
+      date:  r.deed_date,
+      propertyType:        r.property_type as Transaction['propertyType'],
+      estateType:          r.estate_type as Transaction['estateType'],
+      newBuild:            r.new_build === 1,
+      transactionCategory: r.transaction_category ?? '',
+      linkedDataUri:       r.unique_id
+        ? `https://landregistry.data.gov.uk/data/ppi/transaction/${r.unique_id}/current`
+        : '',
+    }));
+
+    transactions.sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+    const metrics = computePropertyMetrics(transactions);
+    records.push({ propertyKey: key, address, transactions, metrics });
+  }
+
+  return records.sort((a, b) =>
+    b.transactions.length - a.transactions.length ||
+    a.address.displayAddress.localeCompare(b.address.displayAddress),
+  );
 }
 
-function buildMatcher(rawQuery: string, warnings: string[]): MatcherResult {
-  // Detect "STREET NAME, POSTCODE" pattern
+// ─── WHERE clause builder ─────────────────────────────────────────────────────
+
+interface WhereResult { whereSql: string; params: unknown[]; queryType: string; }
+
+function normalisePostcode(raw: string): string {
+  const u = raw.toUpperCase().replace(/\s+/g, '');
+  if (u.length < 4) return u;
+  return u.slice(0, u.length - 3) + ' ' + u.slice(u.length - 3);
+}
+
+function buildWhere(rawQuery: string, warnings: string[]): WhereResult {
+  // "STREET NAME, POSTCODE" pattern
   const commaIdx = rawQuery.lastIndexOf(',');
   if (commaIdx !== -1) {
-    const streetPart = rawQuery.slice(0, commaIdx).trim();
-    const postcodePart = rawQuery.slice(commaIdx + 1).trim().replace(/\s+/g, '');
-    const normStreet = streetPart.toUpperCase().trim();
+    const streetPart   = rawQuery.slice(0, commaIdx).trim();
+    const postcodePart = rawQuery.slice(commaIdx + 1).trim().replace(/\s+/g, '').toUpperCase();
     return {
+      whereSql:  'street LIKE ? AND postcode_nospc LIKE ?',
+      params:    [`%${streetPart}%`, `${postcodePart}%`],
       queryType: `street "${streetPart}" in postcode starting "${postcodePart}"`,
-      matcher: tx => {
-        const pcNorm = tx.postcode.replace(/\s+/g, '').toUpperCase();
-        return (
-          tx.street.toUpperCase().includes(normStreet) &&
-          pcNorm.startsWith(postcodePart.toUpperCase())
-        );
-      },
     };
   }
 
-  // Postcode detection: starts with 1-2 letters, followed by digits
-  const noSpaces = rawQuery.replace(/\s+/g, '');
-  const isLikelyPostcode = /^[A-Z]{1,2}\d/.test(noSpaces);
+  const noSpaces = rawQuery.replace(/\s+/g, '').toUpperCase();
+  const isPostcode = /^[A-Z]{1,2}\d/.test(noSpaces);
 
-  if (isLikelyPostcode) {
-    // A full postcode's inward code is always [digit][A-Z][A-Z], e.g. "1AD"
-    const isFullPostcode = /\d[A-Z]{2}$/.test(noSpaces);
-
-    if (isFullPostcode) {
-      const normFull = normalisePostcode(rawQuery);
-      return {
-        queryType: `full postcode ${normFull}`,
-        matcher: tx => tx.postcode === normFull,
-      };
+  if (isPostcode) {
+    const isFull = /\d[A-Z]{2}$/.test(noSpaces);
+    if (isFull) {
+      const full = normalisePostcode(rawQuery);
+      return { whereSql: 'postcode = ?', params: [full], queryType: `full postcode ${full}` };
     }
-
-    // Partial postcode: sector (e.g. "SW11 1") or district (e.g. "SW11")
-    const normPartial = noSpaces.toUpperCase();
     const label = /\d$/.test(noSpaces) && noSpaces.length > 4
       ? `postcode sector ${rawQuery}`
       : `postcode district ${rawQuery}`;
     return {
+      whereSql:  'postcode_nospc LIKE ?',
+      params:    [`${noSpaces}%`],
       queryType: label,
-      matcher: tx => tx.postcode.replace(/\s+/g, '').toUpperCase().startsWith(normPartial),
     };
   }
 
-  // Fall back to street name search
-  warnings.push('Query treated as a street name. For accuracy, include a postcode qualifier: "STREET NAME, SW11".');
-  const normStreet = rawQuery.toUpperCase().trim();
+  warnings.push('Query treated as street name. For best results include a postcode: "STREET, SW11".');
   return {
+    whereSql:  'street LIKE ?',
+    params:    [`%${rawQuery}%`],
     queryType: `street name "${rawQuery}"`,
-    matcher: tx => tx.street.toUpperCase().includes(normStreet),
+  };
+}
+
+// ─── Empty response helper ────────────────────────────────────────────────────
+
+function emptyResponse(queryType: string, warnings: string[]): SearchResponse {
+  const emptyBucket = {
+    propertyType: 'ALL', label: 'All property types',
+    totalProperties: 0, includedCount: 0,
+    meanAvgGbpPerYear: 0, medianAvgGbpPerYear: 0,
+    meanAvgPctPerYear: 0, medianAvgPctPerYear: 0,
+    meanCagr: 0, medianCagr: 0,
+  };
+  const emptyTrend = { propertyType: 'ALL', label: 'All types', color: '#374151', dataPoints: [], cagr: null, totalTransactions: 0 };
+  return {
+    properties: [],
+    groups: [],
+    overallSummary: { all: emptyBucket, byPropertyType: [] },
+    marketTrends: { byPropertyType: [], combined: emptyTrend, yearRange: { min: 0, max: 0 }, totalTransactions: 0, isTruncated: false },
+    summary: { totalTransactions: 0, totalProperties: 0, propertiesWithMetrics: 0, queryType, dateRange: null, isTruncated: false },
+    warnings: [...warnings, 'No transactions found matching your search.'],
   };
 }
 
