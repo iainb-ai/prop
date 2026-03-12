@@ -8,6 +8,7 @@ import {
 
 interface Props {
   trends: MarketTrends;
+  onCompare?: (cagr: number) => void;
 }
 
 type Tab = 'prices' | 'yoy' | 'index' | 'volume';
@@ -87,7 +88,7 @@ function computeYDomain(
   return [lo - pad, hi + pad];
 }
 
-export default function MarketTrendsPanel({ trends }: Props) {
+export default function MarketTrendsPanel({ trends, onCompare }: Props) {
   const [activeTab, setActiveTab]     = useState<Tab>('prices');
   const [showCombined, setShowCombined] = useState(false);
   // Hidden types — 'O' (Other) is hidden by default
@@ -241,6 +242,7 @@ export default function MarketTrendsPanel({ trends }: Props) {
                 <th className="pb-2 font-medium text-right">CAGR</th>
                 <th className="pb-2 font-medium text-right">Best yr</th>
                 <th className="pb-2 font-medium text-right">Worst yr</th>
+                {onCompare && <th className="pb-2 font-medium text-right">Rent vs Buy</th>}
               </tr>
             </thead>
             <tbody>
@@ -276,6 +278,18 @@ export default function MarketTrendsPanel({ trends }: Props) {
                     <td className="py-2 text-right text-red-600">
                       {worstPt ? `${worstPt.year} (${formatPct(worstPt.yoyPctChange!, 1)})` : '—'}
                     </td>
+                    {onCompare && (
+                      <td className="py-2 text-right">
+                        {trend.cagr !== null && (
+                          <button
+                            onClick={() => onCompare(trend.cagr!)}
+                            className="text-xs px-2 py-1 rounded bg-lr-green text-white hover:bg-lr-green/80 transition-colors"
+                          >
+                            Compare
+                          </button>
+                        )}
+                      </td>
+                    )}
                   </tr>
                 );
               })}

@@ -7,6 +7,7 @@ import MarketTrendsPanel from './components/MarketTrendsPanel';
 import PropertyList from './components/PropertyList';
 import PropertyDetail from './components/PropertyDetail';
 import GroupTable from './components/GroupTable';
+import RentVsBuyPage from './components/RentVsBuyPage';
 import { LoadingState, SearchResponse, PropertyRecord, GroupByDimension } from './types';
 import { exportPropertyMetrics, exportTransactions, exportGroupSummary } from './utils/export';
 
@@ -22,6 +23,8 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'properties' | 'groups'>('properties');
   const [searchError, setSearchError] = useState<string | null>(null);
   const [searchElapsed, setSearchElapsed] = useState(0);
+  const [rentVsBuyOpen, setRentVsBuyOpen] = useState(false);
+  const [rentVsBuyCagr, setRentVsBuyCagr] = useState<number | null>(null);
   const pollRef   = useRef<ReturnType<typeof setInterval> | null>(null);
   const timerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -97,6 +100,16 @@ export default function App() {
     setAppState('ready');
   }
 
+  function handleCompare(cagr: number) {
+    setRentVsBuyCagr(cagr);
+    setRentVsBuyOpen(true);
+  }
+
+  function handleCloseRentVsBuy() {
+    setRentVsBuyOpen(false);
+    setRentVsBuyCagr(null);
+  }
+
   return (
     <div className="min-h-screen bg-gray-50 flex flex-col">
       <header className="bg-lr-dark text-white px-6 py-4 flex items-center justify-between">
@@ -134,7 +147,7 @@ export default function App() {
 
             <ResultsOverview result={searchResult} />
 
-            <MarketTrendsPanel trends={searchResult.marketTrends} />
+            <MarketTrendsPanel trends={searchResult.marketTrends} onCompare={handleCompare} />
 
             <OverallSummaryPanel summary={searchResult.overallSummary} />
 
@@ -224,6 +237,15 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {rentVsBuyOpen && (
+        <div className="fixed inset-0 bg-white z-50 overflow-y-auto">
+          <RentVsBuyPage
+            initialPropertyGrowth={rentVsBuyCagr}
+            onClose={handleCloseRentVsBuy}
+          />
+        </div>
+      )}
 
       <footer className="bg-white border-t border-gray-200 px-6 py-4 text-xs text-gray-500">
         <p>

@@ -44,17 +44,24 @@ function updateState(patch: Partial<LoadingState>, logLine?: string): void {
 // Runs in a Worker thread so the main event loop stays free for HTTP requests.
 // SQLite WAL mode allows concurrent reads while the worker holds the write lock.
 
-function needsOptimisation(d: BetterSqlite3.Database): boolean {
-  const idx = d.prepare(
-    "SELECT COUNT(*) as n FROM sqlite_master WHERE type='index' AND name='idx_postcode_nospc_cover'",
-  ).get() as { n: number };
-  if (idx.n === 0) return true;
+const REQUIRED_INDEXES = [
+  'idx_postcode_nospc_cover',
+  'idx_postcode_nospc_pkey',
+  'idx_postcode_pkey',
+];
 
+function needsOptimisation(d: BetterSqlite3.Database): boolean {
+  for (const name of REQUIRED_INDEXES) {
+    const row = d.prepare(
+      "SELECT COUNT(*) as n FROM sqlite_master WHERE type='index' AND name=?",
+    ).get(name) as { n: number };
+    if (row.n === 0) return true;
+  }
   try {
     const stats = d.prepare('SELECT COUNT(*) as n FROM sqlite_stat1').get() as { n: number };
     return stats.n === 0;
   } catch {
-    return true; // sqlite_stat1 may not exist if ANALYZE was never run
+    return true;
   }
 }
 
@@ -70,10 +77,14 @@ function startOptimisationWorker(dbPath: string): void {
     db.pragma('journal_mode = WAL');
     db.pragma('busy_timeout = 120000'); // 2 min — wait if main thread briefly blocks write
     try {
-      parentPort.postMessage({ log: 'Creating covering index (postcode_nospc)…' });
+      parentPort.postMessage({ log: 'Creating covering index (postcode_nospc, deed_year, type, price)…' });
       db.exec('CREATE INDEX IF NOT EXISTS idx_postcode_nospc_cover ON transactions(postcode_nospc, deed_year, property_type, price_paid)');
-      parentPort.postMessage({ log: 'Creating covering index (postcode)…' });
+      parentPort.postMessage({ log: 'Creating covering index (postcode, deed_year, type, price)…' });
       db.exec('CREATE INDEX IF NOT EXISTS idx_postcode_cover ON transactions(postcode, deed_year, property_type, price_paid)');
+      parentPort.postMessage({ log: 'Creating property-key lookup index (postcode_nospc, property_key)…' });
+      db.exec('CREATE INDEX IF NOT EXISTS idx_postcode_nospc_pkey ON transactions(postcode_nospc, property_key)');
+      parentPort.postMessage({ log: 'Creating property-key lookup index (postcode, property_key)…' });
+      db.exec('CREATE INDEX IF NOT EXISTS idx_postcode_pkey ON transactions(postcode, property_key)');
       parentPort.postMessage({ log: 'Running ANALYZE — query planner will use indexes correctly after this…' });
       db.exec('ANALYZE transactions');
       db.close();
@@ -146,6 +157,12 @@ function createIndexes(d: BetterSqlite3.Database): void {
       ON transactions(postcode_nospc, deed_year, property_type, price_paid);
     CREATE INDEX IF NOT EXISTS idx_postcode_cover
       ON transactions(postcode, deed_year, property_type, price_paid);
+    -- Covering indexes for property-key lookup queries: makes GROUP BY property_key
+    -- index-only (no main-table row reads needed to retrieve property_key).
+    CREATE INDEX IF NOT EXISTS idx_postcode_nospc_pkey
+      ON transactions(postcode_nospc, property_key);
+    CREATE INDEX IF NOT EXISTS idx_postcode_pkey
+      ON transactions(postcode, property_key);
   `);
 }
 
@@ -187,12 +204,14 @@ export async function initDatabase(): Promise<void> {
         db = new BetterSqlite3(DB_PATH);
         db.pragma('journal_mode = WAL');
         db.pragma('cache_size = -131072'); // 128 MB page cache
-        db.pragma('temp_store = MEMORY');  // keep temp tables (window fn sort buffers) in RAM
-        db.pragma('mmap_size = 17179869184'); // 16 GB mmap — let OS cache the file
+        db.pragma('temp_store = MEMORY');
+        db.pragma('mmap_size = 4294967296'); // 4 GB mmap
+        db.pragma('busy_timeout = 10000');   // 10 s wait if write lock contention
         const count = countRow.n;
+        const dbSizeMb = Math.round(require('fs').statSync(DB_PATH).size / 1e6);
         updateState(
           { status: 'ready', progress: 100, rowsProcessed: count },
-          `✓ Existing database loaded — ${count.toLocaleString()} transactions`,
+          `✓ Database loaded — ${count.toLocaleString()} transactions, ${dbSizeMb} MB`,
         );
         // Kick off background optimisation if covering indexes or ANALYZE are missing
         if (needsOptimisation(db)) startOptimisationWorker(DB_PATH);
@@ -367,7 +386,8 @@ async function importCsv(): Promise<void> {
   db.pragma('journal_mode = WAL');
   db.pragma('cache_size = -131072');
   db.pragma('temp_store = MEMORY');
-  db.pragma('mmap_size = 17179869184');
+  db.pragma('mmap_size = 4294967296');
+  db.pragma('busy_timeout = 10000');
 
   updateState(
     { status: 'ready', progress: 100, rowsProcessed: rowsInserted, message: 'Ready' },

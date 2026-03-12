@@ -148,3 +148,73 @@ export interface SearchResponse {
   };
   warnings: string[];
 }
+
+// ─── Rent vs Buy API ──────────────────────────────────────────────────────────
+
+export interface RentVsBuyRequest {
+  purchasePrice: number;
+  deposit: number;
+  horizonMonths: number;
+  sellAtEnd: boolean;
+  mortgageType: 'repayment' | 'interest_only';
+  annualRate: number;
+  termMonths: number;
+  mortgageArrangementFee: number;
+  monthlyRent: number;
+  rentAnnualInflation: number;
+  renterMonthlyCosts: number;
+  annualPropertyGrowth: number;
+  maintenancePct: number;
+  councilTaxAnnual: number;
+  homeInsuranceAnnual: number;
+  serviceChargeAnnual: number;
+  runningCostInflation: number;
+  investmentGrossAnnualReturn: number;
+  investmentAnnualFees: number;
+  investmentTaxDrag: number;
+  firstTimeBuyer: boolean;
+  additionalPropertySurcharge: boolean;
+  nonUkResidentSurcharge: boolean;
+  legalFeesPurchase: number;
+  surveyValuation: number;
+  movingMiscCosts: number;
+  estateAgentFeePct: number;
+  saleLegalFixedCosts: number;
+  overrideBudget: boolean;
+  manualMonthlyBudget: number;
+  budgetAnnualGrowth: number;
+}
+
+export interface RentVsBuyMonthRow {
+  month: number;
+  date: string;
+  budget: number;
+  rent: number;
+  renterCosts: number;
+  totalRentOutflow: number;
+  rentInvestContrib: number;
+  rentInvestBal: number;
+  rentNetWorth: number;
+  mortgagePmt: number;
+  ownerRunningCosts: number;
+  totalOwnerOutflow: number;
+  buyInvestContrib: number;
+  buyInvestBal: number;
+  propertyValue: number;
+  mortgageBalance: number;
+  saleCosts: number;
+  upfrontCosts: number;
+  buyNetWorth: number;
+  diffBuyMinusRent: number;
+  buyBetter: 0 | 1;
+}
+
+export interface RentVsBuyResponse {
+  sdlt: number;
+  totalUpfront: number;
+  monthlyPmt: number;
+  breakEvenMonth: number | null;
+  finalBuyNetWorth: number;
+  finalRentNetWorth: number;
+  months: RentVsBuyMonthRow[];
+}
