@@ -7,16 +7,17 @@ import {
 
 export function computePropertyMetrics(
   transactions: Transaction[],
+  alreadySorted = false,
 ): PropertyMetrics | undefined {
   if (transactions.length < 2) return undefined;
 
-  const sorted = [...transactions].sort((a, b) => {
+  const ordered = alreadySorted ? transactions : [...transactions].sort((a, b) => {
     const d = a.date.localeCompare(b.date);
     return d !== 0 ? d : a.id.localeCompare(b.id);
   });
 
-  const first = sorted[0];
-  const last = sorted[sorted.length - 1];
+  const first = ordered[0];
+  const last = ordered[ordered.length - 1];
   const P0 = first.price;
   const P1 = last.price;
 
@@ -77,7 +78,7 @@ function groupKey(record: PropertyRecord, dim: GroupByDimension): string {
   const pc = address.postcode.replace(/\s+/g, '');
   switch (dim) {
     case 'postcodeUnit':     return address.postcode;
-    case 'postcodeSector':   return pc.slice(0, pc.length - 2) + ' ' + pc.slice(pc.length - 2, pc.length - 1);
+    case 'postcodeSector':   return pc.slice(0, pc.length - 3) + ' ' + pc[pc.length - 3];
     case 'postcodeDistrict': return pc.replace(/\d[A-Z]{2}$/, '').trim();
     case 'propertyType':     return address.postcode.split(' ')[0] + '/' + (record.transactions[0]?.propertyType ?? 'O');
     case 'buildingOrStreet': return address.paon || address.street;
@@ -89,7 +90,7 @@ function groupLabel(record: PropertyRecord, dim: GroupByDimension): string {
   const pc = address.postcode.replace(/\s+/g, '');
   switch (dim) {
     case 'postcodeUnit':     return address.postcode;
-    case 'postcodeSector':   return pc.slice(0, pc.length - 2) + ' ' + pc.slice(pc.length - 2, pc.length - 1);
+    case 'postcodeSector':   return pc.slice(0, pc.length - 3) + ' ' + pc[pc.length - 3];
     case 'postcodeDistrict': return pc.replace(/\d[A-Z]{2}$/, '').trim();
     case 'propertyType':     return PROPERTY_TYPE_LABELS[record.transactions[0]?.propertyType ?? 'O'] ?? 'Other';
     case 'buildingOrStreet': return address.paon || address.street;
@@ -119,7 +120,14 @@ export function computeGroups(
     const abs    = included.map(r => r.metrics!.absoluteChange);
     const gbpYr  = included.map(r => r.metrics!.avgGbpPerYear);
     const cagrs  = included.map(r => r.metrics!.cagr);
-    const allDates = recs.flatMap(r => r.transactions.map(t => t.date));
+    let minDate = '';
+    let maxDate = '';
+    for (const r of recs) {
+      const f = r.metrics?.firstSaleDate ?? r.transactions[0]?.date ?? '';
+      const l = r.metrics?.lastSaleDate  ?? r.transactions[r.transactions.length - 1]?.date ?? '';
+      if (f && (minDate === '' || f < minDate)) minDate = f;
+      if (l && (maxDate === '' || l > maxDate)) maxDate = l;
+    }
 
     groups.push({
       groupKey: key, groupLabel: label,
@@ -129,8 +137,8 @@ export function computeGroups(
       meanAvgGbpPerYear: mean(gbpYr), meanCagr: mean(cagrs),
       minPercentChange: included.length > 0 ? Math.min(...pcts) : 0,
       maxPercentChange: included.length > 0 ? Math.max(...pcts) : 0,
-      minFirstSaleDate: allDates.length > 0 ? allDates.reduce((a, b) => a < b ? a : b) : '',
-      maxLastSaleDate:  allDates.length > 0 ? allDates.reduce((a, b) => a > b ? a : b) : '',
+      minFirstSaleDate: minDate,
+      maxLastSaleDate:  maxDate,
     });
   }
 

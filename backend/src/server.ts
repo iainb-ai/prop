@@ -3,6 +3,8 @@ import cors from 'cors';
 import statusRouter from './routes/status';
 import searchRouter from './routes/search';
 import rentVsBuyRouter from './routes/rentVsBuy';
+import uploadRouter from './routes/upload';
+import propertyRouter from './routes/property';
 import { initDatabase } from './services/database';
 
 const app  = express();
@@ -34,7 +36,9 @@ app.use(express.json({ limit: '1mb' }));
 
 app.get('/api/health', (_req, res) => res.json({ status: 'ok' }));
 app.use('/api/status',      statusRouter);
+app.use('/api/upload',      uploadRouter);
 app.use('/api/search',      searchRouter);
+app.use('/api/property',    propertyRouter);
 app.use('/api/rent-vs-buy', rentVsBuyRouter);
 
 // ─── Global error handler ─────────────────────────────────────────────────────

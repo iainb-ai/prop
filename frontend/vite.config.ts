@@ -12,4 +12,14 @@ export default defineConfig({
       },
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          recharts: ['recharts'],
+          'rent-vs-buy': ['./src/components/RentVsBuyPage'],
+        },
+      },
+    },
+  },
 });

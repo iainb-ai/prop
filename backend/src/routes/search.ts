@@ -139,7 +139,13 @@ router.post('/', (req: Request, res: Response) => {
 
     // ── 4. Build property records (linear grouping — rows are pre-sorted) ─────
     const tBuild = Date.now();
-    const { records: properties, uniqueKeyCount } = buildPropertyRecords(detailRows);
+    const { records: propertiesFull, uniqueKeyCount } = buildPropertyRecords(detailRows);
+    // Trim each property's transactions to just the last one to reduce payload.
+    // Full transaction history is available via GET /api/property?key=...
+    const properties = propertiesFull.map(p => ({
+      ...p,
+      transactions: p.transactions.slice(-1),
+    }));
     timings.build = Date.now() - tBuild;
 
     // ── 5. Total property count ───────────────────────────────────────────────
@@ -242,7 +248,7 @@ function buildPropertyRecords(
         ? `https://landregistry.data.gov.uk/data/ppi/transaction/${r.unique_id}/current`
         : '',
     }));
-    const metrics = computePropertyMetrics(transactions);
+    const metrics = computePropertyMetrics(transactions, true);
     records.push({ propertyKey: currentKey, address, transactions, metrics });
   }
 

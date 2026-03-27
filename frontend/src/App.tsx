@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, lazy, Suspense } from 'react';
 import LoadingScreen from './components/LoadingScreen';
 import SearchForm from './components/SearchForm';
 import ResultsOverview from './components/ResultsOverview';
@@ -7,7 +7,7 @@ import MarketTrendsPanel from './components/MarketTrendsPanel';
 import PropertyList from './components/PropertyList';
 import PropertyDetail from './components/PropertyDetail';
 import GroupTable from './components/GroupTable';
-import RentVsBuyPage from './components/RentVsBuyPage';
+const RentVsBuyPage = lazy(() => import('./components/RentVsBuyPage'));
 import { LoadingState, SearchResponse, PropertyRecord, GroupByDimension } from './types';
 import { exportPropertyMetrics, exportTransactions, exportGroupSummary } from './utils/export';
 
@@ -91,6 +91,22 @@ export default function App() {
     } catch (err) {
       setSearchError(err instanceof Error ? err.message : 'Search failed');
       setAppState('ready');
+    }
+  }
+
+  async function handleSelectProperty(record: PropertyRecord) {
+    setSelectedProperty(record);
+    // If we only have the trimmed (last-tx-only) record, fetch full transaction history
+    if (record.transactions.length < (record.metrics?.transactionCount ?? 2)) {
+      try {
+        const res = await fetch(`/api/property?key=${encodeURIComponent(record.propertyKey)}`);
+        if (res.ok) {
+          const full: PropertyRecord = await res.json();
+          setSelectedProperty(full);
+        }
+      } catch {
+        // keep trimmed record on failure
+      }
     }
   }
 
@@ -213,7 +229,7 @@ export default function App() {
                   <PropertyList
                     properties={searchResult.properties}
                     selectedKey={selectedProperty?.propertyKey ?? null}
-                    onSelect={setSelectedProperty}
+                    onSelect={handleSelectProperty}
                   />
                 </div>
                 <div className="lg:col-span-2">
@@ -240,10 +256,12 @@ export default function App() {
 
       {rentVsBuyOpen && (
         <div className="fixed inset-0 bg-white z-50 overflow-y-auto">
-          <RentVsBuyPage
-            initialPropertyGrowth={rentVsBuyCagr}
-            onClose={handleCloseRentVsBuy}
-          />
+          <Suspense fallback={<div className="flex items-center justify-center h-full text-gray-500">Loading…</div>}>
+            <RentVsBuyPage
+              initialPropertyGrowth={rentVsBuyCagr}
+              onClose={handleCloseRentVsBuy}
+            />
+          </Suspense>
         </div>
       )}
 
