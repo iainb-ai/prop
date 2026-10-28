@@ -41,9 +41,9 @@ interface DbRow {
 // With covering indexes (postcode_nospc, deed_year, property_type, price_paid)
 // these queries never touch main table rows.
 //
-// IMPORTANT: SQLite's query planner mis-estimates LIKE selectivity on large
-// tables and picks idx_property_key (stat: 2 rows/key) over the postcode
-// covering indexes. INDEXED BY forces the correct choice; tested 56x speedup.
+// IMPORTANT: postcode prefixes are matched as a range (>= prefix AND < prefix+U+FFFF),
+// not LIKE — case-insensitive LIKE can't seek a BINARY index, so it full-scans it.
+// INDEXED BY stops the planner picking idx_property_key (stat: 2 rows/key).
 
 function trendGroupBySql(
   fullWhere: string, typeExpr: string, groupExtra: string, indexName: string,
@@ -317,8 +317,8 @@ function buildWhere(rawQuery: string, warnings: string[]): WhereResult {
     const streetPart   = rawQuery.slice(0, commaIdx).trim();
     const postcodePart = rawQuery.slice(commaIdx + 1).trim().replace(/\s+/g, '').toUpperCase();
     return {
-      whereSql:   'street LIKE ? AND postcode_nospc LIKE ?',
-      params:     [`%${streetPart}%`, `${postcodePart}%`],
+      whereSql:   'street LIKE ? AND postcode_nospc >= ? AND postcode_nospc < ?',
+      params:     [`%${streetPart}%`, postcodePart, postcodePart + '￿'],
       queryType:  `street "${streetPart}" in postcode starting "${postcodePart}"`,
       trendIndex: 'idx_postcode_nospc_cover',
       keyIndex:   'idx_postcode_nospc_pkey',
@@ -344,8 +344,8 @@ function buildWhere(rawQuery: string, warnings: string[]): WhereResult {
       ? `postcode sector ${rawQuery}`
       : `postcode district ${rawQuery}`;
     return {
-      whereSql:   'postcode_nospc LIKE ?',
-      params:     [`${noSpaces}%`],
+      whereSql:   'postcode_nospc >= ? AND postcode_nospc < ?',
+      params:     [noSpaces, noSpaces + '￿'],
       queryType:  label,
       trendIndex: 'idx_postcode_nospc_cover',
       keyIndex:   'idx_postcode_nospc_pkey',
