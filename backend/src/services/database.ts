@@ -2,6 +2,7 @@ import BetterSqlite3 from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createReadStream } from 'fs';
+import { PassThrough } from 'stream';
 import { Worker } from 'worker_threads';
 import { parse } from 'csv-parse';
 import { LoadingState } from '../types';
@@ -87,6 +88,8 @@ function startOptimisationWorker(dbPath: string): void {
       db.exec('CREATE INDEX IF NOT EXISTS idx_postcode_pkey ON transactions(postcode, property_key)');
       parentPort.postMessage({ log: 'Running ANALYZE — query planner will use indexes correctly after this…' });
       db.exec('ANALYZE transactions');
+      parentPort.postMessage({ log: 'Checkpointing WAL — merging index pages into main DB file…' });
+      db.pragma('wal_checkpoint(RESTART)');
       db.close();
       parentPort.postMessage({ done: true });
     } catch (err) {
@@ -152,18 +155,10 @@ function createIndexes(d: BetterSqlite3.Database): void {
     CREATE INDEX IF NOT EXISTS idx_street         ON transactions(street);
     CREATE INDEX IF NOT EXISTS idx_property_key   ON transactions(property_key);
     CREATE INDEX IF NOT EXISTS idx_year_type      ON transactions(deed_year, property_type);
-    -- Covering indexes: avoid table row lookups for the trend aggregation query
-    CREATE INDEX IF NOT EXISTS idx_postcode_nospc_cover
-      ON transactions(postcode_nospc, deed_year, property_type, price_paid);
-    CREATE INDEX IF NOT EXISTS idx_postcode_cover
-      ON transactions(postcode, deed_year, property_type, price_paid);
-    -- Covering indexes for property-key lookup queries: makes GROUP BY property_key
-    -- index-only (no main-table row reads needed to retrieve property_key).
-    CREATE INDEX IF NOT EXISTS idx_postcode_nospc_pkey
-      ON transactions(postcode_nospc, property_key);
-    CREATE INDEX IF NOT EXISTS idx_postcode_pkey
-      ON transactions(postcode, property_key);
+    CREATE INDEX IF NOT EXISTS idx_unique_id      ON transactions(unique_id);
   `);
+  // Covering indexes are created by startOptimisationWorker in the background
+  // so searches are available immediately after import without waiting for them.
 }
 
 // ─── Row helpers ───────────────────────────────────────────────────────────────
@@ -207,6 +202,22 @@ export async function initDatabase(): Promise<void> {
         db.pragma('temp_store = MEMORY');
         db.pragma('mmap_size = 4294967296'); // 4 GB mmap
         db.pragma('busy_timeout = 10000');   // 10 s wait if write lock contention
+
+        // Checkpoint any large WAL file back into the main DB.
+        // The background index worker writes ~GBs of WAL that often goes un-checkpointed
+        // because the passive close-checkpoint can't run while this connection is open.
+        // A TRUNCATE checkpoint blocks briefly then resets the WAL to zero, so subsequent
+        // reads no longer have to traverse the WAL index on every page access.
+        const walPath = DB_PATH + '-wal';
+        if (fs.existsSync(walPath)) {
+          const walMb = Math.round(fs.statSync(walPath).size / 1e6);
+          if (walMb > 50) {
+            updateState({}, `⟳ Checkpointing ${walMb} MB WAL file — this may take a few seconds…`);
+            db.pragma('wal_checkpoint(TRUNCATE)');
+            updateState({}, '✓ WAL checkpoint complete — reads are now faster');
+          }
+        }
+
         const count = countRow.n;
         const dbSizeMb = Math.round(require('fs').statSync(DB_PATH).size / 1e6);
         updateState(
@@ -253,10 +264,18 @@ async function importCsv(): Promise<void> {
   );
 
   const d = new BetterSqlite3(DB_IMPORT_PATH);
-  d.pragma('journal_mode = WAL');
+  // page_size must be set before the first write (before createSchema).
+  // 65536-byte pages reduce I/O depth on a large DB; has no effect if the file
+  // already contains data (safe to leave in place for re-runs).
+  d.pragma('page_size = 65536');
+  // journal_mode OFF is safe here: DB_IMPORT_PATH is a throw-away temp file.
+  // If the process crashes we delete it and restart; no WAL overhead at all.
+  d.pragma('journal_mode = OFF');
   d.pragma('synchronous = OFF');
-  d.pragma('cache_size = -262144'); // 256 MB
+  d.pragma('locking_mode = EXCLUSIVE');
+  d.pragma('cache_size = -524288'); // 512 MB
   d.pragma('temp_store = MEMORY');
+  d.pragma('mmap_size = 4294967296'); // 4 GB
 
   createSchema(d);
 
@@ -271,7 +290,7 @@ async function importCsv(): Promise<void> {
        @town, @district_name, @county, @transaction_category, @property_key, @display_address)
   `);
 
-  const BATCH = 50_000;
+  const BATCH = 200_000;
   let batch: Record<string, unknown>[] = [];
 
   const flush = d.transaction((rows: Record<string, unknown>[]) => {
@@ -281,7 +300,7 @@ async function importCsv(): Promise<void> {
   let lastProgressLog = 0;
 
   await new Promise<void>((resolve, reject) => {
-    const readStream = createReadStream(CSV_PATH, { highWaterMark: 1024 * 1024 });
+    const readStream = createReadStream(CSV_PATH, { highWaterMark: 16 * 1024 * 1024 });
     readStream.on('data', (chunk: Buffer | string) => { bytesRead += Buffer.isBuffer(chunk) ? chunk.length : Buffer.byteLength(chunk); });
 
     const parser = readStream.pipe(
@@ -393,4 +412,132 @@ async function importCsv(): Promise<void> {
     { status: 'ready', progress: 100, rowsProcessed: rowsInserted, message: 'Ready' },
     `✓ Import complete — ${rowsInserted.toLocaleString()} transactions ready`,
   );
+}
+
+// ─── Incremental merge ────────────────────────────────────────────────────────
+
+export interface MergeResult {
+  added: number;
+  duplicates: number;
+  skipped: number;
+  dateRange: { min: string; max: string } | null;
+}
+
+export async function mergeFromBuffer(buffer: Buffer): Promise<MergeResult> {
+  if (!db) throw new Error('Database not initialised');
+
+  const insertStmt = db.prepare(`
+    INSERT INTO transactions
+      (unique_id, price_paid, deed_date, deed_year, postcode, postcode_nospc,
+       property_type, new_build, estate_type, paon, saon, street, locality,
+       town, district_name, county, transaction_category, property_key, display_address)
+    VALUES
+      (@unique_id, @price_paid, @deed_date, @deed_year, @postcode, @postcode_nospc,
+       @property_type, @new_build, @estate_type, @paon, @saon, @street, @locality,
+       @town, @district_name, @county, @transaction_category, @property_key, @display_address)
+  `);
+
+  const flushInsert = db.transaction((rows: Record<string, unknown>[]) => {
+    for (const r of rows) insertStmt.run(r);
+  });
+
+  let added = 0, duplicates = 0, skipped = 0;
+  let minDate = '', maxDate = '';
+
+  const PARSE_BATCH = 10_000;
+  let pending: Record<string, unknown>[] = [];
+
+  function dedupAndInsert(rows: Record<string, unknown>[]): void {
+    const existingIds = new Set<string>();
+    const withIds = rows.filter(r => r.unique_id);
+    const CHUNK = 900;
+    for (let i = 0; i < withIds.length; i += CHUNK) {
+      const ids = withIds.slice(i, i + CHUNK).map(r => r.unique_id as string);
+      const placeholders = ids.map(() => '?').join(',');
+      const found = db!
+        .prepare(`SELECT unique_id FROM transactions WHERE unique_id IN (${placeholders})`)
+        .all(ids) as { unique_id: string }[];
+      for (const f of found) existingIds.add(f.unique_id);
+    }
+    const newRows = rows.filter(r => !r.unique_id || !existingIds.has(r.unique_id as string));
+    duplicates += rows.length - newRows.length;
+    if (newRows.length > 0) {
+      flushInsert(newRows);
+      added += newRows.length;
+    }
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const pt = new PassThrough();
+    const parser = pt.pipe(
+      parse({ relax_column_count: true, skip_empty_lines: true, trim: true }),
+    );
+
+    parser.on('data', (cols: string[]) => {
+      if (cols[C.STATUS] === 'D') { skipped++; return; }
+
+      const rawPrice = cols[C.PRICE]?.replace(/[£,]/g, '');
+      const price = parseInt(rawPrice, 10);
+      if (!price || price <= 0) { skipped++; return; }
+
+      const deedDate = parseDate(cols[C.DATE] || '');
+      if (!deedDate || deedDate.length < 4) { skipped++; return; }
+      const deedYear = parseInt(deedDate.substring(0, 4), 10);
+
+      const rawPostcode = (cols[C.POSTCODE] || '').trim();
+      if (!rawPostcode) { skipped++; return; }
+      const postcode = normalisePostcode(rawPostcode);
+      const postcodeNospc = postcode.replace(/\s+/g, '').toUpperCase();
+
+      const paon     = (cols[C.PAON]     || '').trim();
+      const saon     = (cols[C.SAON]     || '').trim();
+      const street   = (cols[C.STREET]   || '').trim();
+      const locality = (cols[C.LOCALITY] || '').trim();
+      const town     = (cols[C.TOWN]     || '').trim();
+      const district = (cols[C.DISTRICT] || '').trim();
+      const county   = (cols[C.COUNTY]   || '').trim();
+      const guid     = (cols[C.UID]      || '').trim().replace(/[{}]/g, '').toUpperCase();
+
+      if (!minDate || deedDate < minDate) minDate = deedDate;
+      if (!maxDate || deedDate > maxDate) maxDate = deedDate;
+
+      pending.push({
+        unique_id:            guid,
+        price_paid:           price,
+        deed_date:            deedDate,
+        deed_year:            deedYear,
+        postcode,
+        postcode_nospc:       postcodeNospc,
+        property_type:        (cols[C.TYPE]      || 'O').trim().toUpperCase(),
+        new_build:            (cols[C.NEW_BUILD] || '').trim().toUpperCase() === 'Y' ? 1 : 0,
+        estate_type:          (cols[C.TENURE]    || 'F').trim().toUpperCase() === 'L' ? 'L' : 'F',
+        paon, saon, street, locality, town,
+        district_name:        district,
+        county,
+        transaction_category: (cols[C.CATEGORY] || '').trim(),
+        property_key:         buildPropertyKey(postcode, saon, paon, street, town),
+        display_address:      buildDisplayAddress(saon, paon, street, locality, town, postcode),
+      });
+
+      if (pending.length >= PARSE_BATCH) {
+        dedupAndInsert(pending);
+        pending = [];
+      }
+    });
+
+    parser.on('end', () => {
+      if (pending.length > 0) { dedupAndInsert(pending); pending = []; }
+      resolve();
+    });
+    parser.on('error', reject);
+
+    pt.end(buffer);
+  });
+
+  return {
+    added,
+    duplicates,
+    skipped,
+    dateRange: minDate ? { min: minDate, max: maxDate } : null,
+  };
 }

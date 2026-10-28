@@ -7,6 +7,7 @@ import MarketTrendsPanel from './components/MarketTrendsPanel';
 import PropertyList from './components/PropertyList';
 import PropertyDetail from './components/PropertyDetail';
 import GroupTable from './components/GroupTable';
+import MergeUploadModal from './components/MergeUploadModal';
 const RentVsBuyPage = lazy(() => import('./components/RentVsBuyPage'));
 import { LoadingState, SearchResponse, PropertyRecord, GroupByDimension } from './types';
 import { exportPropertyMetrics, exportTransactions, exportGroupSummary } from './utils/export';
@@ -25,6 +26,7 @@ export default function App() {
   const [searchElapsed, setSearchElapsed] = useState(0);
   const [rentVsBuyOpen, setRentVsBuyOpen] = useState(false);
   const [rentVsBuyCagr, setRentVsBuyCagr] = useState<number | null>(null);
+  const [mergeOpen, setMergeOpen] = useState(false);
   const pollRef   = useRef<ReturnType<typeof setInterval> | null>(null);
   const timerRef  = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -133,10 +135,17 @@ export default function App() {
           <h1 className="text-xl font-bold">UK Property Price History Analyser</h1>
           <p className="text-lr-light text-xs mt-0.5">HM Land Registry Price Paid Data</p>
         </div>
-        {appState === 'results' && (
-          <button className="btn-secondary text-sm" onClick={handleNewSearch}>
-            New Search
-          </button>
+        {(appState === 'ready' || appState === 'results' || appState === 'searching') && (
+          <div className="flex gap-2">
+            {appState === 'results' && (
+              <button className="btn-secondary text-sm" onClick={handleNewSearch}>
+                New Search
+              </button>
+            )}
+            <button className="btn-secondary text-sm" onClick={() => setMergeOpen(true)}>
+              Update Dataset
+            </button>
+          </div>
         )}
       </header>
 
@@ -253,6 +262,10 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {mergeOpen && (
+        <MergeUploadModal onClose={() => setMergeOpen(false)} />
+      )}
 
       {rentVsBuyOpen && (
         <div className="fixed inset-0 bg-white z-50 overflow-y-auto">

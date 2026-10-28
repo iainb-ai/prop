@@ -7,7 +7,9 @@
       "Bash(python3 -:*)",
       "Bash(python3 -c \":*)",
       "Bash(python3 -c \"from docx import Document; doc = Document\\(''Rent_versus_Buy_Enhancement_PRD_v2.docx''\\); print\\(''\\\\n''.join\\([para.text for para in doc.paragraphs]\\)\\)\")",
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Bash(ls -la \"c:/Users/iainj/Documents/prop/\"*.sqlite)",
+      "Bash(node -e \":*)"
     ]
   }
 }

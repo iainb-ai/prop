@@ -3,21 +3,31 @@ import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
 import { parseCsv } from '../services/csvParser';
 import { saveDataset, getDataset } from '../services/dataStore';
+import { mergeFromBuffer } from '../services/database';
 import { UploadResponse } from '../types';
 
 const router = Router();
+
+const csvFilter: multer.Options['fileFilter'] = (_req, file, cb) => {
+  if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv')) {
+    cb(null, true);
+  } else {
+    cb(new Error('Only CSV files are accepted.'));
+  }
+};
 
 // Memory storage — files are held in buffer, not written to disk
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 100 * 1024 * 1024 }, // 100 MB
-  fileFilter: (_req, file, cb) => {
-    if (file.mimetype === 'text/csv' || file.originalname.endsWith('.csv')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Only CSV files are accepted.'));
-    }
-  },
+  fileFilter: csvFilter,
+});
+
+// Larger limit for incremental update files (up to 500 MB)
+const uploadMerge = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB
+  fileFilter: csvFilter,
 });
 
 // POST /api/upload
@@ -68,6 +78,21 @@ router.get('/:sessionId', (req: Request, res: Response) => {
     dateRange: dataset.dateRange,
     uploadedAt: dataset.uploadedAt,
   });
+});
+
+// POST /api/upload/merge — append incremental data, dedup on unique_id
+router.post('/merge', uploadMerge.single('file'), async (req: Request, res: Response) => {
+  if (!req.file) {
+    res.status(400).json({ error: 'No file uploaded.' });
+    return;
+  }
+  try {
+    const result = await mergeFromBuffer(req.file.buffer);
+    res.json(result);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : 'Unknown error';
+    res.status(500).json({ error: msg });
+  }
 });
 
 function buildProcessingLog(

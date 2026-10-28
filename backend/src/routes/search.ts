@@ -40,8 +40,15 @@ interface DbRow {
 // Uses AVG as proxy for median — avoids O(n log n) window functions.
 // With covering indexes (postcode_nospc, deed_year, property_type, price_paid)
 // these queries never touch main table rows.
+//
+// IMPORTANT: SQLite's query planner mis-estimates LIKE selectivity on large
+// tables and picks idx_property_key (stat: 2 rows/key) over the postcode
+// covering indexes. INDEXED BY forces the correct choice; tested 56x speedup.
 
-function trendGroupBySql(fullWhere: string, typeExpr: string, groupExtra: string): string {
+function trendGroupBySql(
+  fullWhere: string, typeExpr: string, groupExtra: string, indexName: string,
+): string {
+  const indexed = indexName ? `INDEXED BY ${indexName}` : '';
   return `
     SELECT
       deed_year,
@@ -51,7 +58,7 @@ function trendGroupBySql(fullWhere: string, typeExpr: string, groupExtra: string
       CAST(AVG(price_paid) AS REAL) AS median_price,
       0.0                           AS q1_price,
       0.0                           AS q3_price
-    FROM transactions
+    FROM transactions ${indexed}
     WHERE ${fullWhere}
     GROUP BY deed_year${groupExtra}
     ORDER BY deed_year
@@ -81,7 +88,7 @@ router.post('/', (req: Request, res: Response) => {
   const warnings: string[] = [];
 
   // ── 1. Build WHERE clause ────────────────────────────────────────────────────
-  const { whereSql, params, queryType } = buildWhere(body.query.trim().toUpperCase(), warnings);
+  const { whereSql, params, queryType, trendIndex, keyIndex } = buildWhere(body.query.trim().toUpperCase(), warnings);
 
   let extraWhere = '';
   const extraParams: unknown[] = [];
@@ -96,14 +103,27 @@ router.post('/', (req: Request, res: Response) => {
   const allParams = [...params, ...extraParams];
 
   try {
-    // ── 2. Trend aggregation (two GROUP BY queries, fully index-covered) ──────
+    // ── 2. Trend aggregation — single GROUP BY (one SQL query instead of two) ──
+    // allAggRows (the 'ALL' bucket) is derived from typeAggRows in JS; this saves
+    // one full covering-index scan (~2 s on a 30M-row dataset).
     const tTrend = Date.now();
     const typeAggRows = db
-      .prepare(trendGroupBySql(fullWhere, 'property_type', ', property_type'))
+      .prepare(trendGroupBySql(fullWhere, 'property_type', ', property_type', trendIndex))
       .all(...allParams) as AggYearTypeRow[];
-    const allAggRows = db
-      .prepare(trendGroupBySql(fullWhere, "'ALL'", ''))
-      .all(...allParams) as AggYearTypeRow[];
+
+    // Derive 'ALL' year aggregation from per-type rows (weighted mean)
+    const allByYear = new Map<number, { count: number; wPrice: number }>();
+    for (const r of typeAggRows) {
+      const y = allByYear.get(r.deed_year);
+      if (!y) allByYear.set(r.deed_year, { count: r.count, wPrice: r.mean_price * r.count });
+      else { y.count += r.count; y.wPrice += r.mean_price * r.count; }
+    }
+    const allAggRows: AggYearTypeRow[] = [];
+    for (const [yr, { count, wPrice }] of allByYear) {
+      const mean = wPrice / count;
+      allAggRows.push({ deed_year: yr, property_type: 'ALL', count, mean_price: mean, median_price: mean, q1_price: 0, q3_price: 0 });
+    }
+    allAggRows.sort((a, b) => a.deed_year - b.deed_year);
     timings.trends = Date.now() - tTrend;
 
     if (allAggRows.length === 0) {
@@ -120,16 +140,21 @@ router.post('/', (req: Request, res: Response) => {
     // an index-only GROUP BY (no main-table row reads for property_key).
     // The join back to transactions uses idx_property_key for up to CAP lookups.
     const tDetails = Date.now();
+    const keyIndexed = keyIndex ? `INDEXED BY ${keyIndex}` : '';
     const combinedSql = `
       WITH top_keys AS (
         SELECT property_key, COUNT(*) AS tx_count
-        FROM   transactions
+        FROM   transactions ${keyIndexed}
         WHERE  ${fullWhere}
         GROUP  BY property_key
         ORDER  BY tx_count DESC
         LIMIT  ${PROPERTY_LIST_CAP}
       )
-      SELECT t.*
+      SELECT t.unique_id, t.price_paid, t.deed_date, t.postcode,
+             t.property_type, t.new_build, t.estate_type,
+             t.paon, t.saon, t.street, t.locality, t.town,
+             t.district_name, t.county, t.transaction_category,
+             t.property_key, t.display_address
       FROM   transactions t
       INNER  JOIN top_keys k USING (property_key)
       ORDER  BY k.tx_count DESC, t.property_key, t.deed_date
@@ -159,7 +184,7 @@ router.post('/', (req: Request, res: Response) => {
     } else {
       const tCount = Date.now();
       const countRow = db
-        .prepare(`SELECT COUNT(DISTINCT property_key) AS n FROM transactions WHERE ${fullWhere}`)
+        .prepare(`SELECT COUNT(DISTINCT property_key) AS n FROM transactions ${keyIndexed} WHERE ${fullWhere}`)
         .get(...allParams) as { n: number };
       totalProperties = countRow.n;
       timings.countDistinct = Date.now() - tCount;
@@ -269,7 +294,15 @@ function buildPropertyRecords(
 
 // ─── WHERE clause builder ─────────────────────────────────────────────────────
 
-interface WhereResult { whereSql: string; params: unknown[]; queryType: string; }
+// trendIndex: best index for GROUP BY deed_year aggregations (has price_paid in index)
+// keyIndex:   best index for GROUP BY property_key and COUNT DISTINCT
+interface WhereResult {
+  whereSql:   string;
+  params:     unknown[];
+  queryType:  string;
+  trendIndex: string;  // e.g. 'idx_postcode_nospc_cover' — empty = let planner decide
+  keyIndex:   string;  // e.g. 'idx_postcode_nospc_pkey'  — empty = let planner decide
+}
 
 function normalisePostcode(raw: string): string {
   const u = raw.toUpperCase().replace(/\s+/g, '');
@@ -278,15 +311,17 @@ function normalisePostcode(raw: string): string {
 }
 
 function buildWhere(rawQuery: string, warnings: string[]): WhereResult {
-  // "STREET NAME, POSTCODE" pattern
+  // "STREET NAME, POSTCODE" pattern — postcode provides the covering index selectivity
   const commaIdx = rawQuery.lastIndexOf(',');
   if (commaIdx !== -1) {
     const streetPart   = rawQuery.slice(0, commaIdx).trim();
     const postcodePart = rawQuery.slice(commaIdx + 1).trim().replace(/\s+/g, '').toUpperCase();
     return {
-      whereSql:  'street LIKE ? AND postcode_nospc LIKE ?',
-      params:    [`%${streetPart}%`, `${postcodePart}%`],
-      queryType: `street "${streetPart}" in postcode starting "${postcodePart}"`,
+      whereSql:   'street LIKE ? AND postcode_nospc LIKE ?',
+      params:     [`%${streetPart}%`, `${postcodePart}%`],
+      queryType:  `street "${streetPart}" in postcode starting "${postcodePart}"`,
+      trendIndex: 'idx_postcode_nospc_cover',
+      keyIndex:   'idx_postcode_nospc_pkey',
     };
   }
 
@@ -297,15 +332,23 @@ function buildWhere(rawQuery: string, warnings: string[]): WhereResult {
     const isFull = /\d[A-Z]{2}$/.test(noSpaces);
     if (isFull) {
       const full = normalisePostcode(rawQuery);
-      return { whereSql: 'postcode = ?', params: [full], queryType: `full postcode ${full}` };
+      return {
+        whereSql:   'postcode = ?',
+        params:     [full],
+        queryType:  `full postcode ${full}`,
+        trendIndex: 'idx_postcode_cover',
+        keyIndex:   'idx_postcode_pkey',
+      };
     }
     const label = /\d$/.test(noSpaces) && noSpaces.length > 4
       ? `postcode sector ${rawQuery}`
       : `postcode district ${rawQuery}`;
     return {
-      whereSql:  'postcode_nospc LIKE ?',
-      params:    [`${noSpaces}%`],
-      queryType: label,
+      whereSql:   'postcode_nospc LIKE ?',
+      params:     [`${noSpaces}%`],
+      queryType:  label,
+      trendIndex: 'idx_postcode_nospc_cover',
+      keyIndex:   'idx_postcode_nospc_pkey',
     };
   }
 
@@ -314,9 +357,11 @@ function buildWhere(rawQuery: string, warnings: string[]): WhereResult {
     'For faster results include a postcode: "HIGH STREET, SW11".',
   );
   return {
-    whereSql:  'street LIKE ?',
-    params:    [`%${rawQuery}%`],
-    queryType: `street name "${rawQuery}"`,
+    whereSql:   'street LIKE ?',
+    params:     [`%${rawQuery}%`],
+    queryType:  `street name "${rawQuery}"`,
+    trendIndex: '',  // no useful index for unqualified street scan
+    keyIndex:   '',
   };
 }
 
