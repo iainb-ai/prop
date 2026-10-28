@@ -1,23 +1,76 @@
-import { useRef, useState } from 'react';
-
-interface MergeResult {
-  added: number;
-  duplicates: number;
-  skipped: number;
-  dateRange: { min: string; max: string } | null;
-}
+import { useEffect, useRef, useState } from 'react';
+import { MergeProgress, MergeResult } from '../types';
+import ProgressBar from './ProgressBar';
 
 interface Props {
   onClose: () => void;
 }
 
+type Stage = 'select' | 'uploading' | 'applying' | 'done';
+
+interface UploadProgress {
+  loaded: number;
+  total: number;
+  startedAt: number;
+}
+
 export default function MergeUploadModal({ onClose }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [dragging, setDragging] = useState(false);
-  const [uploading, setUploading] = useState(false);
+  const [stage, setStage] = useState<Stage>('select');
+  const [upload, setUpload] = useState<UploadProgress | null>(null);
+  const [apply, setApply] = useState<MergeProgress | null>(null);
   const [result, setResult] = useState<MergeResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const xhrRef = useRef<XMLHttpRequest | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  function stopPolling() {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+  }
+
+  function startPolling() {
+    stopPolling();
+    async function poll() {
+      try {
+        const res = await fetch('/api/upload/merge/status');
+        const data: MergeProgress = await res.json();
+        setApply(data);
+        if (data.status === 'done') {
+          stopPolling();
+          setResult(data.result);
+          setStage('done');
+        } else if (data.status === 'error') {
+          stopPolling();
+          setError(data.error ?? 'Update failed');
+          setStage('select');
+        }
+      } catch {
+        // transient — keep polling
+      }
+    }
+    poll();
+    pollRef.current = setInterval(poll, 1000);
+  }
+
+  // Re-attach to an update that is still running (e.g. modal closed and reopened)
+  useEffect(() => {
+    fetch('/api/upload/merge/status')
+      .then(r => r.json())
+      .then((data: MergeProgress) => {
+        if (data.status === 'running') {
+          setApply(data);
+          setStage('applying');
+          startPolling();
+        }
+      })
+      .catch(() => {});
+    return () => {
+      stopPolling();
+      xhrRef.current?.abort();
+    };
+  }, []);
 
   function handleFile(f: File) {
     if (!f.name.endsWith('.csv')) {
@@ -29,25 +82,51 @@ export default function MergeUploadModal({ onClose }: Props) {
     setError(null);
   }
 
-  async function handleUpload() {
+  function handleUpload() {
     if (!file) return;
-    setUploading(true);
     setError(null);
     setResult(null);
-    try {
-      const form = new FormData();
-      form.append('file', file);
-      const res = await fetch('/api/upload/merge', { method: 'POST', body: form });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-      setResult(data as MergeResult);
-      setFile(null);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Upload failed');
-    } finally {
-      setUploading(false);
-    }
+    setApply(null);
+    setStage('uploading');
+    setUpload({ loaded: 0, total: file.size, startedAt: Date.now() });
+
+    // XMLHttpRequest rather than fetch so upload progress can be reported
+    const xhr = new XMLHttpRequest();
+    xhrRef.current = xhr;
+    xhr.open('POST', '/api/upload/merge');
+    xhr.upload.onprogress = e => {
+      if (e.lengthComputable) setUpload(u => u && { ...u, loaded: e.loaded, total: e.total });
+    };
+    xhr.onload = () => {
+      xhrRef.current = null;
+      let data: { error?: string } = {};
+      try { data = JSON.parse(xhr.responseText); } catch { /* non-JSON */ }
+      if (xhr.status === 202) {
+        setFile(null);
+        setStage('applying');
+        startPolling();
+      } else {
+        setError(data.error ?? `HTTP ${xhr.status}`);
+        setStage('select');
+      }
+    };
+    xhr.onerror = () => {
+      xhrRef.current = null;
+      setError('Upload failed — is the server running?');
+      setStage('select');
+    };
+    const form = new FormData();
+    form.append('file', file);
+    xhr.send(form);
   }
+
+  const uploadPct = upload && upload.total > 0 ? Math.round((upload.loaded / upload.total) * 100) : 0;
+  const uploadElapsed = upload ? (Date.now() - upload.startedAt) / 1000 : 0;
+  const uploadEta = upload && upload.loaded > 0 && uploadElapsed >= 2
+    ? ((upload.total - upload.loaded) * uploadElapsed) / upload.loaded
+    : null;
+
+  const busy = stage === 'uploading' || stage === 'applying';
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
@@ -67,10 +146,11 @@ export default function MergeUploadModal({ onClose }: Props) {
             >
               Land Registry website
             </a>{' '}
-            and upload it here. New transactions will be added; duplicates are skipped automatically.
+            and upload it here. New transactions are added, corrected ones are updated and withdrawn
+            ones are removed. Duplicates are skipped, and the update is saved permanently.
           </p>
 
-          {!result && (
+          {stage === 'select' && (
             <div
               className={`border-2 border-dashed rounded-lg p-6 text-center cursor-pointer transition-colors ${
                 dragging ? 'border-lr-green bg-green-50' : 'border-gray-300 hover:border-lr-green'
@@ -105,6 +185,45 @@ export default function MergeUploadModal({ onClose }: Props) {
             </div>
           )}
 
+          {busy && (
+            <div className="space-y-4">
+              <StepRow
+                n={1}
+                title="Upload file"
+                state={stage === 'uploading' ? 'active' : 'done'}
+              >
+                {stage === 'uploading' && (
+                  <ProgressBar
+                    label={`${(upload!.loaded / 1e6).toFixed(1)} of ${(upload!.total / 1e6).toFixed(1)} MB`}
+                    progress={uploadPct}
+                    elapsedSec={uploadElapsed}
+                    etaSeconds={uploadEta}
+                  />
+                )}
+              </StepRow>
+              <StepRow
+                n={2}
+                title="Apply to database"
+                state={stage === 'applying' ? 'active' : 'pending'}
+              >
+                {stage === 'applying' && apply && (
+                  <ProgressBar
+                    label={`${(apply.bytesProcessed / 1e6).toFixed(1)} of ${(apply.totalBytes / 1e6).toFixed(1)} MB processed`}
+                    progress={apply.progress}
+                    elapsedSec={apply.elapsedSec}
+                    etaSeconds={apply.etaSeconds}
+                    detail={`${apply.rowsProcessed.toLocaleString()} rows`}
+                  />
+                )}
+              </StepRow>
+              {stage === 'applying' && (
+                <p className="text-xs text-gray-400">
+                  You can close this window. The update continues in the background, and searches still work.
+                </p>
+              )}
+            </div>
+          )}
+
           {error && (
             <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded p-3">
               {error}
@@ -113,10 +232,22 @@ export default function MergeUploadModal({ onClose }: Props) {
 
           {result && (
             <div className="bg-green-50 border border-green-200 rounded p-4 space-y-1 text-sm">
-              <div className="font-semibold text-green-800">Update complete</div>
+              <div className="font-semibold text-green-800">
+                Update complete{apply ? ` in ${apply.elapsedSec}s` : ''}
+              </div>
               <div className="text-green-700">
                 <span className="font-medium">{result.added.toLocaleString()}</span> new transactions added
               </div>
+              {result.updated > 0 && (
+                <div className="text-green-700">
+                  {result.updated.toLocaleString()} transactions corrected
+                </div>
+              )}
+              {result.deleted > 0 && (
+                <div className="text-green-700">
+                  {result.deleted.toLocaleString()} withdrawn transactions removed
+                </div>
+              )}
               {result.duplicates > 0 && (
                 <div className="text-gray-600">
                   {result.duplicates.toLocaleString()} duplicates skipped
@@ -138,18 +269,41 @@ export default function MergeUploadModal({ onClose }: Props) {
 
         <div className="flex justify-end gap-3 px-5 py-4 border-t border-gray-200">
           <button className="btn-secondary text-sm" onClick={onClose}>
-            {result ? 'Close' : 'Cancel'}
+            {stage === 'done' || stage === 'applying' ? 'Close' : 'Cancel'}
           </button>
-          {!result && (
+          {stage !== 'done' && stage !== 'applying' && (
             <button
               className="btn-primary text-sm"
-              disabled={!file || uploading}
+              disabled={!file || stage === 'uploading'}
               onClick={handleUpload}
             >
-              {uploading ? 'Uploading…' : 'Upload & Merge'}
+              {stage === 'uploading' ? 'Uploading…' : 'Upload & Merge'}
             </button>
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+function StepRow({ n, title, state, children }: {
+  n: number;
+  title: string;
+  state: 'pending' | 'active' | 'done';
+  children?: React.ReactNode;
+}) {
+  const badge =
+    state === 'done'   ? 'bg-lr-green text-white' :
+    state === 'active' ? 'border-2 border-lr-green text-lr-green' :
+                         'border-2 border-gray-300 text-gray-400';
+  return (
+    <div className="flex gap-3">
+      <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-semibold shrink-0 ${badge}`}>
+        {state === 'done' ? '✓' : n}
+      </div>
+      <div className="flex-1 min-w-0 space-y-2">
+        <div className={`text-sm font-medium ${state === 'pending' ? 'text-gray-400' : 'text-gray-800'}`}>{title}</div>
+        {children}
       </div>
     </div>
   );

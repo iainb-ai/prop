@@ -2,7 +2,7 @@ import BetterSqlite3 from 'better-sqlite3';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createReadStream } from 'fs';
-import { PassThrough } from 'stream';
+import { Readable } from 'stream';
 import { Worker } from 'worker_threads';
 import { parse } from 'csv-parse';
 import { LoadingState } from '../types';
@@ -31,7 +31,11 @@ let state: LoadingState = {
   message: 'Starting up…', log: [],
 };
 
-export function getLoadingState(): LoadingState { return { ...state }; }
+let phaseStartedAt = Date.now();
+
+export function getLoadingState(): LoadingState {
+  return { ...state, phaseElapsedSec: Math.round((Date.now() - phaseStartedAt) / 1000) };
+}
 
 function updateState(patch: Partial<LoadingState>, logLine?: string): void {
   state = { ...state, ...patch };
@@ -39,6 +43,58 @@ function updateState(patch: Partial<LoadingState>, logLine?: string): void {
     state.log = [...state.log, logLine];
     console.log(`[DB] ${logLine}`);
   }
+}
+
+// Starts a new timed phase: resets elapsed time and ETA shown in the UI.
+function setPhase(message: string, patch: Partial<LoadingState> = {}, logLine?: string): void {
+  phaseStartedAt = Date.now();
+  updateState({ message, etaSeconds: null, indeterminate: false, ...patch }, logLine);
+}
+
+function estimateEta(done: number, total: number, startedAt: number): number | null {
+  const elapsedSec = (Date.now() - startedAt) / 1000;
+  if (done <= 0 || elapsedSec < 3) return null;
+  return Math.max(0, Math.round(((total - done) * elapsedSec) / done));
+}
+
+// ─── SQL in a worker thread ───────────────────────────────────────────────────
+// Long-running statements (index builds, WAL checkpoints) run off the main thread
+// so /api/status keeps answering and the UI can show live progress.
+
+interface SqlStep { label: string; sql: string; pragma?: boolean }
+
+function runSqlInWorker(
+  dbPath: string,
+  pragmas: string[],
+  steps: SqlStep[],
+  onStep: (index: number, step: SqlStep) => void,
+): Promise<void> {
+  const workerScript = `
+    const { workerData, parentPort } = require('worker_threads');
+    const Database = require('better-sqlite3');
+    const db = new Database(workerData.dbPath);
+    try {
+      for (const p of workerData.pragmas) db.pragma(p);
+      workerData.steps.forEach((s, i) => {
+        parentPort.postMessage({ step: i });
+        if (s.pragma) db.pragma(s.sql); else db.exec(s.sql);
+      });
+      db.close();
+      parentPort.postMessage({ done: true });
+    } catch (err) {
+      try { db.close(); } catch {}
+      parentPort.postMessage({ error: String(err) });
+    }
+  `;
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(workerScript, { eval: true, workerData: { dbPath, pragmas, steps } });
+    worker.on('message', (msg: { step?: number; done?: boolean; error?: string }) => {
+      if (msg.step !== undefined) onStep(msg.step, steps[msg.step]);
+      if (msg.done)  resolve();
+      if (msg.error) reject(new Error(msg.error));
+    });
+    worker.on('error', reject);
+  });
 }
 
 // ─── Background optimisation (covering indexes + ANALYZE) ─────────────────────
@@ -66,7 +122,10 @@ function needsOptimisation(d: BetterSqlite3.Database): boolean {
   }
 }
 
+let optimisationRunning = false;
+
 function startOptimisationWorker(dbPath: string): void {
+  optimisationRunning = true;
   updateState({}, '⟳ Running background optimisation (covering indexes + ANALYZE) — searches available now');
 
   // Inline Worker script — pure JS so no TypeScript compilation needed.
@@ -105,6 +164,7 @@ function startOptimisationWorker(dbPath: string): void {
     if (msg.error) updateState({}, `⚠ Background optimisation error: ${msg.error}`);
   });
   worker.on('error', err => console.error('[Optimisation worker]', err));
+  worker.on('exit', () => { optimisationRunning = false; });
 }
 
 // ─── DB handle ────────────────────────────────────────────────────────────────
@@ -148,17 +208,34 @@ function createSchema(d: BetterSqlite3.Database): void {
   `);
 }
 
-function createIndexes(d: BetterSqlite3.Database): void {
-  d.exec(`
-    CREATE INDEX IF NOT EXISTS idx_postcode       ON transactions(postcode);
-    CREATE INDEX IF NOT EXISTS idx_postcode_nospc ON transactions(postcode_nospc);
-    CREATE INDEX IF NOT EXISTS idx_street         ON transactions(street);
-    CREATE INDEX IF NOT EXISTS idx_property_key   ON transactions(property_key);
-    CREATE INDEX IF NOT EXISTS idx_year_type      ON transactions(deed_year, property_type);
-    CREATE INDEX IF NOT EXISTS idx_unique_id      ON transactions(unique_id);
-  `);
-  // Covering indexes are created by startOptimisationWorker in the background
-  // so searches are available immediately after import without waiting for them.
+// Covering indexes are created by startOptimisationWorker in the background
+// so searches are available immediately after import without waiting for them.
+const INDEX_STEPS: SqlStep[] = [
+  { label: 'Creating postcode index',           sql: 'CREATE INDEX IF NOT EXISTS idx_postcode       ON transactions(postcode)' },
+  { label: 'Creating compact postcode index',   sql: 'CREATE INDEX IF NOT EXISTS idx_postcode_nospc ON transactions(postcode_nospc)' },
+  { label: 'Creating street index',             sql: 'CREATE INDEX IF NOT EXISTS idx_street         ON transactions(street)' },
+  { label: 'Creating property-key index',       sql: 'CREATE INDEX IF NOT EXISTS idx_property_key   ON transactions(property_key)' },
+  { label: 'Creating year/type index',          sql: 'CREATE INDEX IF NOT EXISTS idx_year_type      ON transactions(deed_year, property_type)' },
+  { label: 'Creating transaction-ID index',     sql: 'CREATE INDEX IF NOT EXISTS idx_unique_id      ON transactions(unique_id)' },
+  { label: 'Running ANALYZE (query planner statistics)', sql: 'ANALYZE transactions' },
+];
+
+function openMainConnection(): BetterSqlite3.Database {
+  const d = new BetterSqlite3(DB_PATH);
+  d.pragma('journal_mode = WAL');
+  d.pragma('cache_size = -131072'); // 128 MB page cache
+  d.pragma('temp_store = MEMORY');
+  d.pragma('mmap_size = 4294967296'); // 4 GB mmap
+  d.pragma('busy_timeout = 10000');   // 10 s wait if write lock contention
+  return d;
+}
+
+function getMeta(d: BetterSqlite3.Database, key: string): string | undefined {
+  return (d.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined)?.value;
+}
+
+function setMeta(d: BetterSqlite3.Database, key: string, value: string): void {
+  d.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(key, value);
 }
 
 // ─── Row helpers ───────────────────────────────────────────────────────────────
@@ -189,48 +266,43 @@ function parseDate(raw: string): string {
 export async function initDatabase(): Promise<void> {
   // Check for complete DB
   if (fs.existsSync(DB_PATH)) {
+    const dbSizeMb = Math.round(fs.statSync(DB_PATH).size / 1e6);
+    setPhase(
+      'Opening database…',
+      { status: 'loading', mode: 'opening', progress: 5, indeterminate: true },
+      `Opening existing database (${dbSizeMb.toLocaleString()} MB)…`,
+    );
+
+    let complete = false;
     try {
-      const tmp = new BetterSqlite3(DB_PATH, { readonly: true });
-      const row = tmp.prepare("SELECT value FROM meta WHERE key = 'status'").get() as { value: string } | undefined;
-      const countRow = tmp.prepare('SELECT COUNT(*) as n FROM transactions').get() as { n: number };
-      tmp.close();
-
-      if (row?.value === 'complete') {
-        db = new BetterSqlite3(DB_PATH);
-        db.pragma('journal_mode = WAL');
-        db.pragma('cache_size = -131072'); // 128 MB page cache
-        db.pragma('temp_store = MEMORY');
-        db.pragma('mmap_size = 4294967296'); // 4 GB mmap
-        db.pragma('busy_timeout = 10000');   // 10 s wait if write lock contention
-
-        // Checkpoint any large WAL file back into the main DB.
-        // The background index worker writes ~GBs of WAL that often goes un-checkpointed
-        // because the passive close-checkpoint can't run while this connection is open.
-        // A TRUNCATE checkpoint blocks briefly then resets the WAL to zero, so subsequent
-        // reads no longer have to traverse the WAL index on every page access.
-        const walPath = DB_PATH + '-wal';
-        if (fs.existsSync(walPath)) {
-          const walMb = Math.round(fs.statSync(walPath).size / 1e6);
-          if (walMb > 50) {
-            updateState({}, `⟳ Checkpointing ${walMb} MB WAL file — this may take a few seconds…`);
-            db.pragma('wal_checkpoint(TRUNCATE)');
-            updateState({}, '✓ WAL checkpoint complete — reads are now faster');
-          }
-        }
-
-        const count = countRow.n;
-        const dbSizeMb = Math.round(require('fs').statSync(DB_PATH).size / 1e6);
-        updateState(
-          { status: 'ready', progress: 100, rowsProcessed: count },
-          `✓ Database loaded — ${count.toLocaleString()} transactions, ${dbSizeMb} MB`,
-        );
-        // Kick off background optimisation if covering indexes or ANALYZE are missing
-        if (needsOptimisation(db)) startOptimisationWorker(DB_PATH);
-        return;
-      }
-    } catch {
-      fs.unlinkSync(DB_PATH);
+      db = openMainConnection();
+      complete = getMeta(db, 'status') === 'complete';
+    } catch (err) {
+      // Never delete the DB here: it holds every merged update, and a transient
+      // failure (e.g. another instance holding a lock) would silently discard them.
+      try { db?.close(); } catch {}
+      db = null;
+      const reason = err instanceof Error ? err.message : String(err);
+      updateState(
+        {
+          status: 'error',
+          message: 'Could not open database',
+          error: `Could not open ${DB_PATH}: ${reason}. If another copy of the app is running, close it and restart. ` +
+                 'If the file is corrupt, delete it to rebuild from pp-fulldata.csv (merged updates would need re-applying).',
+        },
+        `✗ Could not open database: ${reason}`,
+      );
+      return;
     }
+
+    if (complete) {
+      await finishOpening(db!, dbSizeMb);
+      return;
+    }
+
+    db!.close();
+    db = null;
+    updateState({}, '⚠ Existing database is incomplete — rebuilding from CSV');
   }
 
   // Clean up any abandoned import
@@ -247,7 +319,60 @@ export async function initDatabase(): Promise<void> {
     return;
   }
 
-  await importCsv();
+  try {
+    await importCsv();
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    updateState({ status: 'error', message: 'Import failed', error: `Import failed: ${reason}` }, `✗ Import failed: ${reason}`);
+  }
+}
+
+async function finishOpening(d: BetterSqlite3.Database, dbSizeMb: number): Promise<void> {
+  // Checkpoint any large WAL file back into the main DB.
+  // The background index worker writes ~GBs of WAL that often goes un-checkpointed
+  // because the passive close-checkpoint can't run while this connection is open.
+  // A TRUNCATE checkpoint resets the WAL to zero, so subsequent reads no longer
+  // have to traverse the WAL index on every page access. It runs in a worker so
+  // the status endpoint stays responsive; the idle main connection doesn't block it.
+  const walPath = DB_PATH + '-wal';
+  if (fs.existsSync(walPath)) {
+    const walMb = Math.round(fs.statSync(walPath).size / 1e6);
+    if (walMb > 50) {
+      setPhase(
+        `Applying ${walMb.toLocaleString()} MB of pending changes to the database file…`,
+        { progress: 30, indeterminate: true },
+        `⟳ Checkpointing ${walMb.toLocaleString()} MB WAL file…`,
+      );
+      try {
+        await runSqlInWorker(DB_PATH, ['busy_timeout = 60000'], [
+          { label: 'checkpoint', sql: 'wal_checkpoint(TRUNCATE)', pragma: true },
+        ], () => {});
+        updateState({}, `✓ WAL checkpoint complete in ${getLoadingState().phaseElapsedSec}s — reads are now faster`);
+      } catch (err) {
+        updateState({}, `⚠ WAL checkpoint skipped: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+  }
+
+  let count: number;
+  if (getMeta(d, 'count_tracked') === '1') {
+    count = Number(getMeta(d, 'row_count') ?? 0);
+  } else {
+    // One-off full count; from now on imports and merges keep row_count up to date.
+    setPhase('Counting transactions (one-off)…', { progress: 70, indeterminate: true }, 'Counting transactions (one-off)…');
+    await new Promise(r => setImmediate(r));
+    count = (d.prepare('SELECT COUNT(*) as n FROM transactions').get() as { n: number }).n;
+    setMeta(d, 'row_count', String(count));
+    setMeta(d, 'count_tracked', '1');
+  }
+
+  setPhase(
+    'Ready',
+    { status: 'ready', progress: 100, rowsProcessed: count },
+    `✓ Database loaded — ${count.toLocaleString()} transactions, ${dbSizeMb.toLocaleString()} MB`,
+  );
+  // Kick off background optimisation if covering indexes or ANALYZE are missing
+  if (needsOptimisation(d)) startOptimisationWorker(DB_PATH);
 }
 
 // ─── Import ───────────────────────────────────────────────────────────────────
@@ -258,10 +383,12 @@ async function importCsv(): Promise<void> {
   let rowsInserted = 0;
   let rowsSkipped = 0;
 
-  updateState(
-    { status: 'loading', progress: 0, message: 'Importing CSV…' },
+  setPhase(
+    'Step 1 of 2: Reading pp-fulldata.csv…',
+    { status: 'loading', mode: 'importing', progress: 0 },
     `Starting import of ${(totalBytes / 1e9).toFixed(1)} GB file…`,
   );
+  const importStartedAt = Date.now();
 
   const d = new BetterSqlite3(DB_IMPORT_PATH);
   // page_size must be set before the first write (before createSchema).
@@ -364,14 +491,15 @@ async function importCsv(): Promise<void> {
         batch = [];
 
         const pct = Math.min(78, Math.round((bytesRead / totalBytes) * 80));
+        const etaSeconds = estimateEta(bytesRead, totalBytes, importStartedAt);
         if (rowsInserted - lastProgressLog >= 500_000) {
           lastProgressLog = rowsInserted;
           updateState(
-            { progress: pct, rowsProcessed: rowsInserted, message: `Importing… ${rowsInserted.toLocaleString()} rows` },
+            { progress: pct, rowsProcessed: rowsInserted, etaSeconds },
             `  Processed ${rowsInserted.toLocaleString()} rows (${pct}%)`,
           );
         } else {
-          state = { ...state, progress: pct, rowsProcessed: rowsInserted };
+          state = { ...state, progress: pct, rowsProcessed: rowsInserted, etaSeconds };
         }
       }
     });
@@ -385,48 +513,113 @@ async function importCsv(): Promise<void> {
   });
 
   updateState(
-    { progress: 80, message: 'Creating indexes…' },
+    { progress: 80, rowsProcessed: rowsInserted },
     `✓ ${rowsInserted.toLocaleString()} rows inserted (${rowsSkipped.toLocaleString()} skipped). Creating indexes…`,
   );
-
-  createIndexes(d);
-  updateState({ progress: 90 }, '✓ Indexes created. Running ANALYZE (query planner statistics)…');
-
-  d.exec('ANALYZE transactions');
-  updateState({ progress: 95 }, '✓ ANALYZE complete');
-
-  d.prepare("INSERT INTO meta VALUES ('status', 'complete')").run();
-  d.prepare("INSERT INTO meta VALUES ('row_count', ?)").run(String(rowsInserted));
   d.close();
+
+  // Index builds take several minutes on the full dataset — run them in a worker
+  // so progress keeps reaching the UI.
+  await runSqlInWorker(
+    DB_IMPORT_PATH,
+    ['journal_mode = OFF', 'synchronous = OFF', 'cache_size = -524288', 'temp_store = MEMORY'],
+    [
+      ...INDEX_STEPS,
+      { label: 'Finalising', sql: `INSERT INTO meta VALUES ('status', 'complete'), ('row_count', '${rowsInserted}'), ('count_tracked', '1')` },
+    ],
+    (i, step) => {
+      const total = INDEX_STEPS.length + 1;
+      setPhase(
+        `Step 2 of 2: ${step.label} (${i + 1} of ${total})…`,
+        { progress: 80 + Math.round((i / total) * 18), indeterminate: true },
+        `⟳ ${step.label}…`,
+      );
+    },
+  );
 
   fs.renameSync(DB_IMPORT_PATH, DB_PATH);
 
-  db = new BetterSqlite3(DB_PATH);
-  db.pragma('journal_mode = WAL');
-  db.pragma('cache_size = -131072');
-  db.pragma('temp_store = MEMORY');
-  db.pragma('mmap_size = 4294967296');
-  db.pragma('busy_timeout = 10000');
+  db = openMainConnection();
 
-  updateState(
-    { status: 'ready', progress: 100, rowsProcessed: rowsInserted, message: 'Ready' },
+  setPhase(
+    'Ready',
+    { status: 'ready', progress: 100, rowsProcessed: rowsInserted },
     `✓ Import complete — ${rowsInserted.toLocaleString()} transactions ready`,
   );
 }
 
 // ─── Incremental merge ────────────────────────────────────────────────────────
+// Runs as a background job so the UI can poll progress via getMergeProgress().
+// Record status (last column) in LR update files: A = add, C = change, D = delete.
 
 export interface MergeResult {
   added: number;
+  updated: number;
+  deleted: number;
   duplicates: number;
   skipped: number;
   dateRange: { min: string; max: string } | null;
 }
 
-export async function mergeFromBuffer(buffer: Buffer): Promise<MergeResult> {
-  if (!db) throw new Error('Database not initialised');
+export interface MergeProgress {
+  status: 'idle' | 'running' | 'done' | 'error';
+  progress: number;       // 0–100
+  bytesProcessed: number;
+  totalBytes: number;
+  rowsProcessed: number;
+  elapsedSec: number;
+  etaSeconds: number | null;
+  result: MergeResult | null;
+  error?: string;
+}
 
-  const insertStmt = db.prepare(`
+let merge: MergeProgress = {
+  status: 'idle', progress: 0, bytesProcessed: 0, totalBytes: 0,
+  rowsProcessed: 0, elapsedSec: 0, etaSeconds: null, result: null,
+};
+let mergeStartedAt = 0;
+
+export function getMergeProgress(): MergeProgress {
+  if (merge.status !== 'running') return { ...merge };
+  return {
+    ...merge,
+    elapsedSec: Math.round((Date.now() - mergeStartedAt) / 1000),
+    etaSeconds: estimateEta(merge.bytesProcessed, merge.totalBytes, mergeStartedAt),
+  };
+}
+
+// Throws if a merge can't start; otherwise applies the file in the background.
+export function startMerge(buffer: Buffer): void {
+  if (!db || state.status !== 'ready') throw new Error('Database is not ready yet.');
+  if (merge.status === 'running') throw new Error('An update is already being applied.');
+  if (optimisationRunning) {
+    throw new Error('Background database optimisation is still running — please try again in a few minutes.');
+  }
+
+  mergeStartedAt = Date.now();
+  merge = {
+    status: 'running', progress: 0, bytesProcessed: 0, totalBytes: buffer.length,
+    rowsProcessed: 0, elapsedSec: 0, etaSeconds: null, result: null,
+  };
+  console.log(`[DB] Merge started (${(buffer.length / 1e6).toFixed(1)} MB)`);
+
+  mergeFromBuffer(buffer)
+    .then(result => {
+      merge = { ...getMergeProgress(), status: 'done', progress: 100, etaSeconds: 0, result };
+      console.log(`[DB] Merge complete: ${JSON.stringify(result)}`);
+    })
+    .catch(err => {
+      merge = { ...getMergeProgress(), status: 'error', etaSeconds: null, error: err instanceof Error ? err.message : String(err) };
+      console.error('[DB] Merge failed:', err);
+    });
+}
+
+interface PendingRow { status: string; id: string; row: Record<string, unknown> | null }
+
+async function mergeFromBuffer(buffer: Buffer): Promise<MergeResult> {
+  const d = db!;
+
+  const insertStmt = d.prepare(`
     INSERT INTO transactions
       (unique_id, price_paid, deed_date, deed_year, postcode, postcode_nospc,
        property_type, new_build, estate_type, paon, saon, street, locality,
@@ -436,56 +629,67 @@ export async function mergeFromBuffer(buffer: Buffer): Promise<MergeResult> {
        @property_type, @new_build, @estate_type, @paon, @saon, @street, @locality,
        @town, @district_name, @county, @transaction_category, @property_key, @display_address)
   `);
+  const existsStmt = d.prepare('SELECT 1 FROM transactions WHERE unique_id = ? LIMIT 1');
+  const deleteStmt = d.prepare('DELETE FROM transactions WHERE unique_id = ?');
 
-  const flushInsert = db.transaction((rows: Record<string, unknown>[]) => {
-    for (const r of rows) insertStmt.run(r);
-  });
-
-  let added = 0, duplicates = 0, skipped = 0;
+  let added = 0, updated = 0, deleted = 0, duplicates = 0, skipped = 0;
   let minDate = '', maxDate = '';
 
-  const PARSE_BATCH = 10_000;
-  let pending: Record<string, unknown>[] = [];
-
-  function dedupAndInsert(rows: Record<string, unknown>[]): void {
-    const existingIds = new Set<string>();
-    const withIds = rows.filter(r => r.unique_id);
-    const CHUNK = 900;
-    for (let i = 0; i < withIds.length; i += CHUNK) {
-      const ids = withIds.slice(i, i + CHUNK).map(r => r.unique_id as string);
-      const placeholders = ids.map(() => '?').join(',');
-      const found = db!
-        .prepare(`SELECT unique_id FROM transactions WHERE unique_id IN (${placeholders})`)
-        .all(ids) as { unique_id: string }[];
-      for (const f of found) existingIds.add(f.unique_id);
+  // Rows are applied in file order so an add followed by a change/delete of the
+  // same transaction within one file resolves correctly.
+  const applyBatch = d.transaction((rows: PendingRow[]) => {
+    for (const { status, id, row } of rows) {
+      if (!row) { deleted += deleteStmt.run(id).changes; continue; }
+      if (id && existsStmt.get(id)) {
+        if (status === 'C') { deleteStmt.run(id); insertStmt.run(row); updated++; }
+        else duplicates++;
+      } else {
+        insertStmt.run(row);
+        added++;
+      }
     }
-    const newRows = rows.filter(r => !r.unique_id || !existingIds.has(r.unique_id as string));
-    duplicates += rows.length - newRows.length;
-    if (newRows.length > 0) {
-      flushInsert(newRows);
-      added += newRows.length;
+  });
+
+  // Feed the parser in 1 MB slices so progress can be tracked by bytes consumed.
+  const SLICE = 1024 * 1024;
+  function* slices(): Generator<Buffer> {
+    for (let off = 0; off < buffer.length; off += SLICE) {
+      merge.bytesProcessed = Math.min(off + SLICE, buffer.length);
+      yield buffer.subarray(off, off + SLICE);
     }
   }
+  const parser = Readable.from(slices(), { objectMode: false, highWaterMark: SLICE })
+    .pipe(parse({ relax_column_count: true, skip_empty_lines: true, trim: true }));
 
-  await new Promise<void>((resolve, reject) => {
-    const pt = new PassThrough();
-    const parser = pt.pipe(
-      parse({ relax_column_count: true, skip_empty_lines: true, trim: true }),
-    );
+  const BATCH = 5_000;
+  let pending: PendingRow[] = [];
 
-    parser.on('data', (cols: string[]) => {
-      if (cols[C.STATUS] === 'D') { skipped++; return; }
+  async function flush(): Promise<void> {
+    applyBatch(pending);
+    merge.rowsProcessed += pending.length;
+    merge.progress = Math.min(99, Math.round((merge.bytesProcessed / merge.totalBytes) * 100));
+    pending = [];
+    await new Promise(r => setImmediate(r)); // let status polls and searches through
+  }
 
+  for await (const cols of parser as AsyncIterable<string[]>) {
+    const status = (cols[C.STATUS] || '').toUpperCase();
+    const guid   = (cols[C.UID] || '').replace(/[{}]/g, '').toUpperCase();
+
+    if (status === 'D') {
+      if (guid) pending.push({ status, id: guid, row: null });
+      else skipped++;
+    } else {
       const rawPrice = cols[C.PRICE]?.replace(/[£,]/g, '');
       const price = parseInt(rawPrice, 10);
-      if (!price || price <= 0) { skipped++; return; }
+      if (!price || price <= 0) { skipped++; continue; }
 
       const deedDate = parseDate(cols[C.DATE] || '');
-      if (!deedDate || deedDate.length < 4) { skipped++; return; }
+      if (!deedDate || deedDate.length < 4) { skipped++; continue; }
       const deedYear = parseInt(deedDate.substring(0, 4), 10);
 
       const rawPostcode = (cols[C.POSTCODE] || '').trim();
-      if (!rawPostcode) { skipped++; return; }
+      if (!rawPostcode) { skipped++; continue; }
       const postcode = normalisePostcode(rawPostcode);
       const postcodeNospc = postcode.replace(/\s+/g, '').toUpperCase();
 
@@ -496,46 +700,45 @@ export async function mergeFromBuffer(buffer: Buffer): Promise<MergeResult> {
       const town     = (cols[C.TOWN]     || '').trim();
       const district = (cols[C.DISTRICT] || '').trim();
       const county   = (cols[C.COUNTY]   || '').trim();
-      const guid     = (cols[C.UID]      || '').trim().replace(/[{}]/g, '').toUpperCase();
 
       if (!minDate || deedDate < minDate) minDate = deedDate;
       if (!maxDate || deedDate > maxDate) maxDate = deedDate;
 
       pending.push({
-        unique_id:            guid,
-        price_paid:           price,
-        deed_date:            deedDate,
-        deed_year:            deedYear,
-        postcode,
-        postcode_nospc:       postcodeNospc,
-        property_type:        (cols[C.TYPE]      || 'O').trim().toUpperCase(),
-        new_build:            (cols[C.NEW_BUILD] || '').trim().toUpperCase() === 'Y' ? 1 : 0,
-        estate_type:          (cols[C.TENURE]    || 'F').trim().toUpperCase() === 'L' ? 'L' : 'F',
-        paon, saon, street, locality, town,
-        district_name:        district,
-        county,
-        transaction_category: (cols[C.CATEGORY] || '').trim(),
-        property_key:         buildPropertyKey(postcode, saon, paon, street, town),
-        display_address:      buildDisplayAddress(saon, paon, street, locality, town, postcode),
+        status,
+        id: guid,
+        row: {
+          unique_id:            guid,
+          price_paid:           price,
+          deed_date:            deedDate,
+          deed_year:            deedYear,
+          postcode,
+          postcode_nospc:       postcodeNospc,
+          property_type:        (cols[C.TYPE]      || 'O').trim().toUpperCase(),
+          new_build:            (cols[C.NEW_BUILD] || '').trim().toUpperCase() === 'Y' ? 1 : 0,
+          estate_type:          (cols[C.TENURE]    || 'F').trim().toUpperCase() === 'L' ? 'L' : 'F',
+          paon, saon, street, locality, town,
+          district_name:        district,
+          county,
+          transaction_category: (cols[C.CATEGORY] || '').trim(),
+          property_key:         buildPropertyKey(postcode, saon, paon, street, town),
+          display_address:      buildDisplayAddress(saon, paon, street, locality, town, postcode),
+        },
       });
+    }
 
-      if (pending.length >= PARSE_BATCH) {
-        dedupAndInsert(pending);
-        pending = [];
-      }
-    });
+    if (pending.length >= BATCH) await flush();
+  }
+  if (pending.length > 0) await flush();
 
-    parser.on('end', () => {
-      if (pending.length > 0) { dedupAndInsert(pending); pending = []; }
-      resolve();
-    });
-    parser.on('error', reject);
-
-    pt.end(buffer);
-  });
+  const rowCount = Number(getMeta(d, 'row_count') ?? 0) + added - deleted;
+  setMeta(d, 'row_count', String(rowCount));
+  state = { ...state, rowsProcessed: rowCount };
 
   return {
     added,
+    updated,
+    deleted,
     duplicates,
     skipped,
     dateRange: minDate ? { min: minDate, max: maxDate } : null,

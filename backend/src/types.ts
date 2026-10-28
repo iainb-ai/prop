@@ -7,6 +7,10 @@ export interface LoadingState {
   message: string;
   log: string[];
   error?: string;
+  mode?: 'opening' | 'importing';
+  phaseElapsedSec?: number;
+  etaSeconds?: number | null;
+  indeterminate?: boolean;
 }
 
 // ─── Parsed transaction (from DB row) ─────────────────────────────────────────

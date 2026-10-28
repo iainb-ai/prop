@@ -3,7 +3,7 @@ import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
 import { parseCsv } from '../services/csvParser';
 import { saveDataset, getDataset } from '../services/dataStore';
-import { mergeFromBuffer } from '../services/database';
+import { startMerge, getMergeProgress } from '../services/database';
 import { UploadResponse } from '../types';
 
 const router = Router();
@@ -80,18 +80,24 @@ router.get('/:sessionId', (req: Request, res: Response) => {
   });
 });
 
-// POST /api/upload/merge — append incremental data, dedup on unique_id
-router.post('/merge', uploadMerge.single('file'), async (req: Request, res: Response) => {
+// GET /api/upload/merge/status — progress of the current/last merge
+router.get('/merge/status', (_req: Request, res: Response) => {
+  res.json(getMergeProgress());
+});
+
+// POST /api/upload/merge — start applying an incremental file (adds, changes, deletes).
+// Responds 202 once the file is received; poll /merge/status for progress.
+router.post('/merge', uploadMerge.single('file'), (req: Request, res: Response) => {
   if (!req.file) {
     res.status(400).json({ error: 'No file uploaded.' });
     return;
   }
   try {
-    const result = await mergeFromBuffer(req.file.buffer);
-    res.json(result);
+    startMerge(req.file.buffer);
+    res.status(202).json(getMergeProgress());
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Unknown error';
-    res.status(500).json({ error: msg });
+    res.status(409).json({ error: msg });
   }
 });
 

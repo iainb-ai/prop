@@ -8,6 +8,31 @@ export interface LoadingState {
   message: string;
   log: string[];
   error?: string;
+  mode?: 'opening' | 'importing';
+  phaseElapsedSec?: number;
+  etaSeconds?: number | null;
+  indeterminate?: boolean;
+}
+
+export interface MergeResult {
+  added: number;
+  updated: number;
+  deleted: number;
+  duplicates: number;
+  skipped: number;
+  dateRange: { min: string; max: string } | null;
+}
+
+export interface MergeProgress {
+  status: 'idle' | 'running' | 'done' | 'error';
+  progress: number;
+  bytesProcessed: number;
+  totalBytes: number;
+  rowsProcessed: number;
+  elapsedSec: number;
+  etaSeconds: number | null;
+  result: MergeResult | null;
+  error?: string;
 }
 
 export interface PropertyTypeSummary {
