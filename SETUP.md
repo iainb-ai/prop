@@ -2,13 +2,13 @@
 
 ## Overview
 
-By the end of this guide the app will be running on your Windows PC and open in your web browser at **http://localhost:5173**. You need about 1 hour of hands-on time, plus a few hours of waiting while the app builds its database the first time.
+By the end of this guide the app will be running on your Windows PC or Mac and open in your web browser at **http://localhost:5173**. You need about 1 hour of hands-on time, plus a few hours of waiting while the app builds its database the first time.
 
 The app searches HM Land Registry house-sale records (every sale in England and Wales since 1995) by postcode or street, and shows price history and growth for each property. It runs entirely on your own PC; nothing is sent to the internet.
 
 **Before you start, check you have:**
 
-- Windows 10 or 11 with an administrator account (you will install software)
+- Windows 10 or 11, or macOS 13 or newer, with an administrator account (you will install software). The steps are written for Windows; Mac users should also read "Setting up on a Mac" near the end
 - **At least 50 GB of free disk space**: the data file is about 5 GB and the database the app builds is about 18 GB, with working space on top
 - 16 GB of memory (RAM) is recommended; 8 GB works but searches are slower
 - A reliable internet connection for the downloads
@@ -161,6 +161,53 @@ npm run install:all
 3. Wait for the progress bar to finish. The header's *latest transaction* date updates when you close the window.
 
 Apply each month's file once, in order. If you've missed several months, apply each one from oldest to newest.
+
+## Setting up on a Mac
+
+On a Mac the steps are the same apart from the ones below. Where this section doesn't mention a step, follow the Windows instructions as written. You need macOS 13 (Ventura) or newer, on either an Apple silicon (M1 or later) or Intel Mac.
+
+**Terminal.** Use the *Terminal* app (Finder → Applications → Utilities → Terminal) wherever the guide says PowerShell.
+
+**Step 1 – tools.** You need only three installs:
+
+1. **Apple Command Line Tools.** In Terminal, run the command below and click **Install** in the window that appears (about 10 minutes). This gives you Git, Python and the C++ compiler, so you don't need the Windows Python or Visual Studio Build Tools installs.
+
+    ```
+    xcode-select --install
+    ```
+
+2. **Node.js 24 (LTS).** From [nodejs.org](https://nodejs.org/en/download), download the **macOS Installer (.pkg)** and run it.
+3. **Visual Studio Code** (optional). From [code.visualstudio.com](https://code.visualstudio.com/), download the Mac version and drag it into *Applications*.
+
+Close and reopen Terminal, then check with `git --version`, `node --version` and `python3 --version`. On a Mac, Python's command is `python3`, not `python`.
+
+**Step 2 – code.** The folder command is:
+
+```
+cd ~/Documents
+git clone https://github.com/iainb-ai/prop.git
+cd prop
+```
+
+**Step 4 – data.** To download and name the file in one go, run this from the `prop` folder (plain `curl`, not `curl.exe`):
+
+```
+curl -L -o pp-fulldata.csv https://price-paid-data.publicdata.landregistry.gov.uk/pp-complete.csv
+```
+
+If you download it in the browser instead, Safari may save it to *Downloads* as `pp-complete.csv`. Move it into `Documents/prop` and rename it to `pp-fulldata.csv`.
+
+**Step 5 – first run.** To stop the Mac sleeping during the first build, start the app with `caffeinate -i npm run dev` instead of `npm run dev`. Stop it with **Control + C** (Control, not Command).
+
+**Day-to-day.** Start with `cd ~/Documents/prop` then `npm run dev`. Updating the code and the dataset work exactly as on Windows.
+
+**Mac-specific problems.**
+
+| What you see | What to do |
+| --- | --- |
+| `command not found: git` (or `node`, `npm`) | Run `xcode-select --install` for Git, or reinstall Node.js; then close and reopen Terminal. |
+| *"node" can't be opened because Apple cannot check it* | Open *System Settings → Privacy & Security*, scroll down and click **Open Anyway**. |
+| `EADDRINUSE` / port already in use | Run `lsof -i :3001` to see what is using the port, then close that Terminal window or restart the Mac. |
 
 ## Troubleshooting
 

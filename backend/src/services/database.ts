@@ -398,6 +398,7 @@ async function importCsv(): Promise<void> {
   );
   const importStartedAt = Date.now();
 
+  fs.mkdirSync(path.dirname(DB_IMPORT_PATH), { recursive: true }); // data/ is gitignored, so absent on a fresh clone
   const d = new BetterSqlite3(DB_IMPORT_PATH);
   // page_size must be set before the first write (before createSchema).
   // 65536-byte pages reduce I/O depth on a large DB; has no effect if the file

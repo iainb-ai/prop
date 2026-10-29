@@ -1,39 +1,43 @@
 # UK Property Price History Analyser
 
-**New to this project?** Follow [SETUP.md](SETUP.md) for step-by-step instructions to install the tools, download the code and data, and run the app on Windows.
+Search HM Land Registry Price Paid Data (every residential sale in England and Wales since 1995) by postcode or street, and see price history, growth (CAGR) and market trends for each property. Everything runs locally; the data lives in a SQLite database on your PC.
 
-## How to Start the App
+**New to this project?** Follow [SETUP.md](SETUP.md) for step-by-step instructions (Windows and Mac) to install the tools, download the code and data, and run the app.
 
-### First-time setup (do this once)
+## Quick start
 
-1. Open a terminal (PowerShell or Command Prompt) in the project folder
-2. Run: `npm run install:all`
-3. Wait for it to finish — this downloads all the required software
+Requires Node.js 24, Git, and about 50 GB of free disk space.
 
----
+```
+git clone https://github.com/iainb-ai/prop.git
+cd prop
+npm install
+npm run install:all
+```
 
-### Starting the app
+Download the complete Price Paid Data CSV (`pp-complete.csv`, 5.3 GB) from the [Land Registry single file page](https://www.gov.uk/government/statistical-data-sets/price-paid-data-single-file), save it in the repo root and rename it to `pp-fulldata.csv`. Then:
 
-1. Open a terminal in the project folder
-2. Run: `npm run dev`
-3. Wait until you see messages confirming both the backend and frontend have started
-4. Open your browser and go to: **http://localhost:5173**
+```
+npm run dev
+```
 
----
+Open **http://localhost:5173**. The first start imports the CSV into `data/pp-data.sqlite` (about 18 GB), which takes a few hours; later starts open the existing database in under a minute. Stop the app with `Ctrl + C`.
 
-### Using the app
+## Using the app
 
-1. **Download your data** — Go to https://landregistry.data.gov.uk/app/ppd/ppd_data and download a CSV file of Price Paid Data
-2. **Upload the CSV** — On the app's home screen, drag and drop (or browse for) the CSV file you downloaded
-3. **Search** — Once uploaded, use the search box to look up properties by postcode or street name
-4. **Export results** — You can download the results as a CSV using the export buttons
+- **Search** by full postcode (`SW19 1JU`), sector or district (`SW19 1`, `SW19`), or street within a postcode (`HIGH STREET, SW19`). Street-only searches scan the whole dataset and are slow.
+- **Latest transaction** date in the header shows how up to date the data is.
+- **Update Dataset** applies a monthly update file (`pp-monthly-update-new-version.csv`, from the [downloads page](https://www.gov.uk/government/statistical-data-sets/price-paid-data-downloads)). Apply each month once, oldest first. Updates are stored in the database and kept across restarts.
+- **Export** property metrics, transactions or group summaries as CSV.
 
----
+## Project layout
 
-### Stopping the app
+| Path | Contents |
+| --- | --- |
+| `backend/` | Express + TypeScript API on port 3001 (SQLite via better-sqlite3) |
+| `frontend/` | React + Vite + Tailwind UI on port 5173 (proxies `/api` to the backend) |
+| `rent_vs_buy/` | Standalone Python rent-vs-buy model (`python -m rent_vs_buy.main`) |
+| `data/` | Generated SQLite database (not in git) |
+| `pp-fulldata.csv` | Land Registry source data (not in git) |
 
-Press `Ctrl + C` in the terminal window where the app is running.
-
----
-
-**Note:** The uploaded data is only stored temporarily (for 4 hours). You will need to re-upload the CSV file if you start a new session or if it has been more than 4 hours.
+The database is built from `pp-fulldata.csv` only when `data/pp-data.sqlite` doesn't exist. To rebuild from a newer full CSV, stop the app and delete the `data` folder.
