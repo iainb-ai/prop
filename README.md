@@ -1,5 +1,7 @@
 # UK Property Price History Analyser
 
+**New to this project?** Follow [SETUP.md](SETUP.md) for step-by-step instructions to install the tools, download the code and data, and run the app on Windows.
+
 ## How to Start the App
 
 ### First-time setup (do this once)
