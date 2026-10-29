@@ -11,6 +11,7 @@ import MergeUploadModal from './components/MergeUploadModal';
 const RentVsBuyPage = lazy(() => import('./components/RentVsBuyPage'));
 import { LoadingState, SearchResponse, PropertyRecord, GroupByDimension } from './types';
 import { exportPropertyMetrics, exportTransactions, exportGroupSummary } from './utils/export';
+import { formatDate } from './utils/format';
 
 type AppState = 'loading' | 'ready' | 'searching' | 'results';
 
@@ -112,6 +113,17 @@ export default function App() {
     }
   }
 
+  // Re-read status after an Update Dataset run so the header shows the new latest date
+  async function handleCloseMerge() {
+    setMergeOpen(false);
+    try {
+      const res = await fetch('/api/status');
+      if (res.ok) setLoadingState(await res.json());
+    } catch {
+      // keep existing state
+    }
+  }
+
   function handleNewSearch() {
     setSearchResult(null);
     setSelectedProperty(null);
@@ -133,7 +145,12 @@ export default function App() {
       <header className="bg-lr-dark text-white px-6 py-4 flex items-center justify-between">
         <div>
           <h1 className="text-xl font-bold">UK Property Price History Analyser</h1>
-          <p className="text-lr-light text-xs mt-0.5">HM Land Registry Price Paid Data</p>
+          <p className="text-lr-light text-xs mt-0.5">
+            HM Land Registry Price Paid Data
+            {loadingState.latestTransactionDate && (
+              <> · latest transaction {formatDate(loadingState.latestTransactionDate)}</>
+            )}
+          </p>
         </div>
         {(appState === 'ready' || appState === 'results' || appState === 'searching') && (
           <div className="flex gap-2">
@@ -264,7 +281,7 @@ export default function App() {
       </main>
 
       {mergeOpen && (
-        <MergeUploadModal onClose={() => setMergeOpen(false)} />
+        <MergeUploadModal onClose={handleCloseMerge} />
       )}
 
       {rentVsBuyOpen && (

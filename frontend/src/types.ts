@@ -12,6 +12,7 @@ export interface LoadingState {
   phaseElapsedSec?: number;
   etaSeconds?: number | null;
   indeterminate?: boolean;
+  latestTransactionDate?: string | null; // YYYY-MM-DD
 }
 
 export interface MergeResult {

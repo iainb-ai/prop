@@ -234,6 +234,14 @@ function getMeta(d: BetterSqlite3.Database, key: string): string | undefined {
   return (d.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value: string } | undefined)?.value;
 }
 
+// Uses idx_year_type to narrow to the latest year, so it's ~ms rather than a full scan.
+function getLatestTransactionDate(d: BetterSqlite3.Database): string | null {
+  const row = d.prepare(
+    'SELECT MAX(deed_date) AS d FROM transactions WHERE deed_year = (SELECT MAX(deed_year) FROM transactions)',
+  ).get() as { d: string | null };
+  return row.d;
+}
+
 function setMeta(d: BetterSqlite3.Database, key: string, value: string): void {
   d.prepare('INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)').run(key, value);
 }
@@ -368,7 +376,7 @@ async function finishOpening(d: BetterSqlite3.Database, dbSizeMb: number): Promi
 
   setPhase(
     'Ready',
-    { status: 'ready', progress: 100, rowsProcessed: count },
+    { status: 'ready', progress: 100, rowsProcessed: count, latestTransactionDate: getLatestTransactionDate(d) },
     `✓ Database loaded — ${count.toLocaleString()} transactions, ${dbSizeMb.toLocaleString()} MB`,
   );
   // Kick off background optimisation if covering indexes or ANALYZE are missing
@@ -543,7 +551,7 @@ async function importCsv(): Promise<void> {
 
   setPhase(
     'Ready',
-    { status: 'ready', progress: 100, rowsProcessed: rowsInserted },
+    { status: 'ready', progress: 100, rowsProcessed: rowsInserted, latestTransactionDate: getLatestTransactionDate(db) },
     `✓ Import complete — ${rowsInserted.toLocaleString()} transactions ready`,
   );
 }
@@ -733,7 +741,7 @@ async function mergeFromBuffer(buffer: Buffer): Promise<MergeResult> {
 
   const rowCount = Number(getMeta(d, 'row_count') ?? 0) + added - deleted;
   setMeta(d, 'row_count', String(rowCount));
-  state = { ...state, rowsProcessed: rowCount };
+  state = { ...state, rowsProcessed: rowCount, latestTransactionDate: getLatestTransactionDate(d) };
 
   return {
     added,

@@ -11,6 +11,7 @@ export interface LoadingState {
   phaseElapsedSec?: number;
   etaSeconds?: number | null;
   indeterminate?: boolean;
+  latestTransactionDate?: string | null; // YYYY-MM-DD
 }
 
 // ─── Parsed transaction (from DB row) ─────────────────────────────────────────
